@@ -8,7 +8,6 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use tokio_tungstenite::{connect_async, tungstenite::protocol};
 
-//
 enum Operation {
     Heartbeat = 2,
     HeartbeatReply = 3,
@@ -27,33 +26,41 @@ enum LiveMessage {
     Unknown,
 }
 
-fn decompress_packet(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
-    if data.len() < 16 {
-        return Err(anyhow::anyhow!("Packet too short"));
+fn split_packet_header(data: &[u8]) -> Result<(ProtoHeader, &[u8], &[u8])> {
+    let header = ProtoHeader::deserialize(data)?;
+
+    let length = header.length as usize;
+    let header_length = header.header_length as usize;
+    if length > data.len() {
+        return Err(anyhow::anyhow!("Packet length mismatch"));
     }
 
-    let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let header_length = u16::from_be_bytes([data[4], data[5]]) as usize;
-    let version = u16::from_be_bytes([data[6], data[7]]);
-    let operation = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    let sequence = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+    Ok((header, &data[header_length..length], &data[length..]))
+}
 
-    let payload = &data[header_length..length];
+fn decompress_packet(data: &[u8]) -> Result<Vec<(Vec<u8>, u32)>> {
+    let (hdr, payload, _) = split_packet_header(data)?;
 
-    match version {
-        0 | 1 => return Ok((payload.to_vec(), operation, sequence)),
+    match hdr.version {
+        0 | 1 => return Ok(vec![(payload.to_vec(), hdr.operation)]),
         2 => {
             let mut z = ZlibDecoder::new(payload);
             let mut decompressed_data = Vec::new();
             z.read(&mut decompressed_data)?;
-            return Ok((decompressed_data, operation, sequence));
+            return Ok(vec![(decompressed_data, hdr.operation)]);
         }
         3 => {
-            let mut d = DecompressorReader::new(payload);
             let mut decompressed_data = Vec::new();
-            d.read_to_end(&mut decompressed_data)?;
-            // return Ok((decompressed_data, operation, sequence));
-            decompress_packet(&decompressed_data) // TODO: may contain multiple nested packets
+            DecompressorReader::new(payload).read_to_end(&mut decompressed_data)?;
+
+            let mut results = Vec::new();
+            let mut rest = decompressed_data.as_slice();
+            while !rest.is_empty() {
+                let (hdr, payload, remaining) = split_packet_header(rest)?;
+                results.push((payload.to_vec(), hdr.operation));
+                rest = remaining;
+            }
+            return Ok(results);
         }
         _ => return Err(anyhow::anyhow!("Unknown version")),
     }
@@ -129,8 +136,6 @@ impl LiveMessage {
     }
 }
 
-//
-
 struct ProtoHeader {
     length: u32,
     header_length: u16,
@@ -148,6 +153,24 @@ impl ProtoHeader {
         buf.extend(&self.operation.to_be_bytes());
         buf.extend(&self.sequence.to_be_bytes());
         buf
+    }
+
+    fn deserialize(data: &[u8]) -> Result<Self> {
+        if data.len() < 16 {
+            return Err(anyhow::anyhow!("Data too short to deserialize ProtoHeader"));
+        }
+        let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let header_length = u16::from_be_bytes([data[4], data[5]]);
+        let version = u16::from_be_bytes([data[6], data[7]]);
+        let operation = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        let sequence = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+        Ok(ProtoHeader {
+            length,
+            header_length,
+            version,
+            operation,
+            sequence,
+        })
     }
 }
 
@@ -215,16 +238,12 @@ async fn main() {
         let msg = msg.expect("Failed to read message");
 
         if let protocol::Message::Binary(bin) = msg {
-            // println!("Binary message content: {:?}", bin);
-            let (decompressed_data, _operation, _sequence) =
-                decompress_packet(&bin).expect("Failed to decompress packet");
-            println!(
-                "Op: {}, Decompressed data: {:?}",
-                _operation,
-                String::from_utf8_lossy(&decompressed_data)
-            );
-            let m = LiveMessage::from_payload(&decompressed_data, _operation);
-            println!("Parsed message: {:?}", m);
+            for (decompressed_data, _operation) in
+                decompress_packet(&bin).expect("Failed to decompress packet")
+            {
+                let m = LiveMessage::from_payload(&decompressed_data, _operation);
+                println!("Parsed message: {:?}", m);
+            }
         }
     }
 
