@@ -8,6 +8,8 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use tokio_tungstenite::{connect_async, tungstenite::protocol};
 
+use sqlx::postgres::PgPoolOptions;
+
 enum Operation {
     Heartbeat = 2,
     HeartbeatReply = 3,
@@ -188,8 +190,84 @@ fn build_packet(message: Vec<u8>, operation: u32, sequence: u32) -> Vec<u8> {
     packet
 }
 
+async fn store_danmaku_to_db(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    ts: u64,
+    id: &str,
+    content: &str,
+) -> Result<()> {
+    let query = sqlx::query!(
+        r#"
+        INSERT INTO danmaku (time, id_str, text)
+        VALUES (TO_TIMESTAMP( $1 ), $2, $3)
+        ON CONFLICT (id_str, time) DO NOTHING
+        "#,
+        ts as f64 / 1000.0,
+        id,
+        content
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn handle_msg(msg: &LiveMessage, pool: &sqlx::Pool<sqlx::Postgres>) -> Result<()> {
+    match msg {
+        LiveMessage::Message(m) => {
+            if let Some(cmd) = m.get("cmd").and_then(|c| c.as_str()) {
+                println!("Received command: {}", cmd);
+                match cmd {
+                    "DANMU_MSG" => {
+                        // println!("{}", m.to_string());
+                        if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
+                            if info.len() >= 3 {
+                                /*
+                                let user =
+                                    info[2].get(1).and_then(|u| u.as_str()).unwrap_or("Unknown");
+                                */
+                                let extra = info[0]
+                                    .get(15)
+                                    .and_then(|obj| {
+                                        obj.as_object()
+                                            .and_then(|o| o.get("extra").and_then(|e| e.as_str()))
+                                    })
+                                    .unwrap_or("");
+                                let ts = info[0].get(4).and_then(|t| t.as_u64()).unwrap_or(0);
+                                let id = serde_json::from_str::<serde_json::Value>(extra)
+                                    .ok()
+                                    .and_then(|e| {
+                                        e.get("id_str")
+                                            .and_then(|id| id.as_str().map(|s| s.to_string()))
+                                    })
+                                    .unwrap_or_default();
+                                let content = info[1].as_str().unwrap_or("");
+                                println!("{}: {}: {}", ts, id, content);
+                                store_danmaku_to_db(pool, ts, id.as_str(), content).await?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    };
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> Result<()> {
+    let dml =
+        std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&dml)
+        .await
+        .expect("Failed to create pool");
+
+    println!("Database connected");
+
     let url = "wss://broadcastlv.chat.bilibili.com:443/sub";
 
     let req = Request::builder()
@@ -242,10 +320,11 @@ async fn main() {
                 decompress_packet(&bin).expect("Failed to decompress packet")
             {
                 let m = LiveMessage::from_payload(&decompressed_data, _operation);
-                println!("Parsed message: {:?}", m);
+                handle_msg(&m, &pool).await?;
             }
         }
     }
 
     println!("WebSocket handshake has been successfully completed");
+    Ok(())
 }
