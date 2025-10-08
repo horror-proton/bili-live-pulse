@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use brotlic::DecompressorReader;
 use flate2::bufread::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
@@ -194,16 +194,18 @@ async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
     id: &str,
+    roomid: u32,
     content: &str,
 ) -> Result<()> {
     let query = sqlx::query!(
         r#"
-        INSERT INTO danmaku (time, id_str, text)
-        VALUES (TO_TIMESTAMP( $1 ), $2, $3)
-        ON CONFLICT (id_str, time) DO NOTHING
+        INSERT INTO danmaku (time, id_str, roomid, text)
+        VALUES (TO_TIMESTAMP( $1 ), $2, $3, $4)
+        ON CONFLICT (LEFT(id_str, 4), time) DO NOTHING
         "#,
         ts as f64 / 1000.0,
         id,
+        roomid as i32,
         content
     )
     .execute(pool)
@@ -211,7 +213,11 @@ async fn store_danmaku_to_db(
     Ok(())
 }
 
-async fn handle_msg(msg: &LiveMessage, pool: &sqlx::Pool<sqlx::Postgres>) -> Result<()> {
+async fn handle_msg(
+    roomid: u32,
+    msg: &LiveMessage,
+    pool: &sqlx::Pool<sqlx::Postgres>,
+) -> Result<()> {
     match msg {
         LiveMessage::Message(m) => {
             if let Some(cmd) = m.get("cmd").and_then(|c| c.as_str()) {
@@ -221,28 +227,23 @@ async fn handle_msg(msg: &LiveMessage, pool: &sqlx::Pool<sqlx::Postgres>) -> Res
                         // println!("{}", m.to_string());
                         if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
                             if info.len() >= 3 {
-                                /*
-                                let user =
-                                    info[2].get(1).and_then(|u| u.as_str()).unwrap_or("Unknown");
-                                */
                                 let extra = info[0]
                                     .get(15)
-                                    .and_then(|obj| {
-                                        obj.as_object()
-                                            .and_then(|o| o.get("extra").and_then(|e| e.as_str()))
-                                    })
-                                    .unwrap_or("");
+                                    .context("Missing field 15 in info[0]")?
+                                    .get("extra")
+                                    .context("Missing extra field")?
+                                    .as_str()
+                                    .context("extra is not a string")?;
                                 let ts = info[0].get(4).and_then(|t| t.as_u64()).unwrap_or(0);
-                                let id = serde_json::from_str::<serde_json::Value>(extra)
-                                    .ok()
-                                    .and_then(|e| {
-                                        e.get("id_str")
-                                            .and_then(|id| id.as_str().map(|s| s.to_string()))
-                                    })
-                                    .unwrap_or_default();
+                                let id = serde_json::from_str::<serde_json::Value>(extra)?
+                                    .get("id_str")
+                                    .context("Missing id_str in extra")?
+                                    .as_str()
+                                    .context("id_str is not a string")?
+                                    .to_string();
                                 let content = info[1].as_str().unwrap_or("");
                                 println!("{}: {}: {}", ts, id, content);
-                                store_danmaku_to_db(pool, ts, id.as_str(), content).await?;
+                                store_danmaku_to_db(pool, ts, id.as_str(), roomid, content).await?;
                             }
                         }
                     }
@@ -320,7 +321,7 @@ async fn main() -> Result<()> {
                 decompress_packet(&bin).expect("Failed to decompress packet")
             {
                 let m = LiveMessage::from_payload(&decompressed_data, _operation);
-                handle_msg(&m, &pool).await?;
+                handle_msg(roomid, &m, &pool).await?;
             }
         }
     }
