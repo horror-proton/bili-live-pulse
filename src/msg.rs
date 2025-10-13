@@ -5,7 +5,8 @@ use futures_util::{SinkExt, StreamExt};
 use hyper::Request;
 use serde_json::json;
 use std::io::Read;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -213,6 +214,8 @@ pub struct MsgConnection {
             protocol::Message,
         >,
     >,
+    heartbeat_pending: Arc<AtomicBool>,
+    live_messages: Vec<LiveMessage>,
 }
 
 impl MsgConnection {
@@ -235,7 +238,7 @@ impl MsgConnection {
 
         let (ws_stream, _) = connect_async(req).await.expect("Failed to connect");
 
-        let (mut write, mut read) = ws_stream.split();
+        let (mut write, mut read_stream) = ws_stream.split();
 
         let auth_msg = LiveMessage::new_auth(roomid, key).serialize();
         write
@@ -243,7 +246,7 @@ impl MsgConnection {
             .await
             .context("Failed to send auth message")?;
 
-        let rsp = read.next().await.expect("Failed to read message")?;
+        let rsp = read_stream.next().await.expect("Failed to read message")?;
 
         if let protocol::Message::Binary(bin) = rsp {
             let decompressed = decompress_packet(&bin).context("Failed to decompress packet")?;
@@ -256,8 +259,15 @@ impl MsgConnection {
             }
         }
 
+        let heartbeat_pending = Arc::new(AtomicBool::new(false));
+
+        let p = Arc::clone(&heartbeat_pending);
         let heartbeat_coroutine = tokio::spawn(async move {
             loop {
+                if p.load(SeqCst) {
+                    eprintln!("Heartbeat reply not received, connection may be dead");
+                    break;
+                }
                 let heartbeat_packet = LiveMessage::new_heartbeat().serialize();
                 if let Err(e) = write
                     .send(protocol::Message::binary(heartbeat_packet))
@@ -266,22 +276,62 @@ impl MsgConnection {
                     eprintln!("Failed to send heartbeat: {:?}", e);
                     break;
                 }
+                p.store(true, SeqCst);
                 tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
             }
             write
         });
 
         Ok(MsgConnection {
-            read_stream: read,
+            read_stream,
             sequence: AtomicU32::new(1),
             heartbeat_coroutine,
+            live_messages: Vec::new(),
+            heartbeat_pending,
         })
     }
 
-    pub async fn next_raw(
-        &mut self,
-    ) -> Option<Result<protocol::Message, tokio_tungstenite::tungstenite::Error>> {
-        return self.read_stream.next().await;
+    pub async fn next(&mut self) -> Option<Result<LiveMessage>> {
+        if !self.live_messages.is_empty() {
+            return Some(Ok(self.live_messages.remove(0)));
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = &mut self.heartbeat_coroutine => {
+                    return Some(Err(anyhow::anyhow!("Heartbeat coroutine has finished, connection may be dead")));
+                },
+
+            msg = self.read_stream.next() =>
+                match msg? {
+                    Ok(protocol::Message::Binary(bin)) => {
+                        match decompress_packet(&bin).context("Failed to decompress packet") {
+                            Ok(decompressed) => {
+                                self.live_messages = decompressed
+                                    .iter()
+                                    .map(|(data, op)| LiveMessage::from_payload(data, *op))
+                                    .collect::<Vec<_>>();
+                                if !self.live_messages.is_empty() {
+                                    let first = self.live_messages.remove(0);
+                                    if let LiveMessage::HeartbeatReply((_, _)) = &first {
+                                        self.handle_heartbeat_reply();
+                                    }
+                                    return Some(Ok(first));
+                                }
+                                return Some(Ok(LiveMessage::Unknown));
+                            }
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    Ok(_) => return Some(Ok(LiveMessage::Unknown)),
+                    Err(e) => return Some(Err(anyhow::anyhow!(e))),
+                }
+        };
+    }
+
+    fn handle_heartbeat_reply(&self) {
+        self.heartbeat_pending.store(false, SeqCst);
     }
 }
 

@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
-use tokio_tungstenite::tungstenite::protocol;
 
 use sqlx::postgres::PgPoolOptions;
 
 mod msg;
-use msg::{LiveMessage, decompress_packet};
+use msg::LiveMessage;
 
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
@@ -13,9 +12,9 @@ async fn store_danmaku_to_db(
     roomid: u32,
     content: &str,
 ) -> Result<()> {
-    let query = sqlx::query!(
+    let _ = sqlx::query!(
         r#"
-        INSERT INTO danmaku (time, id_str, roomid, text)
+        INSERT INTO danmaku (time, id_str, room_id, text)
         VALUES (TO_TIMESTAMP( $1 ), $2, $3, $4)
         ON CONFLICT (LEFT(id_str, 4), time) DO NOTHING
         "#,
@@ -29,6 +28,62 @@ async fn store_danmaku_to_db(
     Ok(())
 }
 
+async fn store_online_count_to_db(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    roomid: u32,
+    count: i64,
+) -> Result<()> {
+    // BEGIN ISOLATION LEVEL SERIALIZABLE;
+    // sqlx::postgres::PgAdvisoryLock
+    let raw = format!(
+        r#"
+        BEGIN;
+        SELECT pg_advisory_xact_lock(hashtext('online_rank_count'), {});
+        WITH last_row AS (
+            SELECT * FROM online_rank_count
+            WHERE room_id = {}
+            ORDER BY time DESC
+            LIMIT 1
+        )
+        INSERT INTO online_rank_count (time, room_id, count)
+        SELECT NOW(), {}, {}
+        WHERE NOT EXISTS (SELECT 1 FROM last_row WHERE count = {} AND time > NOW() - INTERVAL '5 minutes');
+        COMMIT;
+        "#,
+        roomid, roomid, roomid, count, count
+    );
+
+    let _ = sqlx::raw_sql(raw.as_str()).execute(pool).await?;
+    Ok(())
+}
+
+async fn store_watched_to_db(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    roomid: u32,
+    count: i64,
+) -> Result<()> {
+    let raw = format!(
+        r#"
+        BEGIN;
+        SELECT pg_advisory_xact_lock(hashtext('watched'), {});
+        WITH last_row AS (
+            SELECT * FROM watched
+            WHERE room_id = {}
+            ORDER BY time DESC
+            LIMIT 1
+        )
+        INSERT INTO watched (time, room_id, num)
+        SELECT NOW(), {}, {}
+        WHERE NOT EXISTS (SELECT 1 FROM last_row WHERE num = {} AND time > NOW() - INTERVAL '5 minutes');
+        COMMIT;
+        "#,
+        roomid, roomid, roomid, count, count
+    );
+
+    let _ = sqlx::raw_sql(raw.as_str()).execute(pool).await?;
+    Ok(())
+}
+
 async fn handle_msg(
     roomid: u32,
     msg: &LiveMessage,
@@ -37,7 +92,6 @@ async fn handle_msg(
     match msg {
         LiveMessage::Message(m) => {
             if let Some(cmd) = m.get("cmd").and_then(|c| c.as_str()) {
-                println!("Received command: {}", cmd);
                 match cmd {
                     "DANMU_MSG" => {
                         // println!("{}", m.to_string());
@@ -63,7 +117,30 @@ async fn handle_msg(
                             }
                         }
                     }
-                    _ => {}
+                    "WATCHED_CHANGE" => {
+                        let val = m
+                            .get("data")
+                            .context("Missing data field")?
+                            .get("num")
+                            .context("Missing num field")?
+                            .as_i64()
+                            .context("not i64")?;
+                        store_watched_to_db(pool, roomid, val).await?;
+                    }
+                    "ONLINE_RANK_COUNT" => {
+                        let val = m
+                            .get("data")
+                            .context("Missing data field")?
+                            .get("count")
+                            .context("Missing count field")?
+                            .as_i64()
+                            .context("not i64")?;
+                        store_online_count_to_db(pool, roomid, val).await?;
+                    }
+                    "INTERACT_WORD_V2" => {}
+                    "ONLINE_RANK_V3" => {}
+                    "STOP_LIVE_ROOM_LIST" => {}
+                    _ => println!("Other command: {}", m.to_string()),
                 }
             }
         }
@@ -90,17 +167,9 @@ async fn main() -> Result<()> {
 
     let mut read = msg::MsgConnection::new(roomid, key).await?;
 
-    while let Some(msg) = read.next_raw().await {
-        let msg = msg.expect("Failed to read message");
-
-        if let protocol::Message::Binary(bin) = msg {
-            for (decompressed_data, _operation) in
-                decompress_packet(&bin).expect("Failed to decompress packet")
-            {
-                let m = LiveMessage::from_payload(&decompressed_data, _operation);
-                handle_msg(roomid, &m, &pool).await?;
-            }
-        }
+    while let Some(m) = read.next().await {
+        let m = m.context("Failed to read message")?;
+        handle_msg(roomid, &m, &pool).await?;
     }
 
     println!("WebSocket handshake has been successfully completed");
