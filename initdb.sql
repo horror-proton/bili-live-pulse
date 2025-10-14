@@ -50,5 +50,19 @@ CREATE TABLE IF NOT EXISTS watched (
 
 CREATE INDEX IF NOT EXISTS idx_watched_room_id ON watched(room_id);
 
+-- live_status
+CREATE TABLE IF NOT EXISTS live_status (
+    "time"      TIMESTAMPTZ  NOT NULL,
+    room_id     INTEGER      NOT NULL,
+    status      SMALLINT      NOT NULL
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'time DESC'
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_status_room_id ON watched(room_id);
+
 --
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;

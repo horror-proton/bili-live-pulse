@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use std::result::Result as StdResult;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 
 mod msg;
 use msg::LiveMessage;
@@ -11,8 +14,8 @@ async fn store_danmaku_to_db(
     id: &str,
     roomid: u32,
     content: &str,
-) -> Result<()> {
-    let _ = sqlx::query!(
+) -> StdResult<PgQueryResult, sqlx::Error> {
+    sqlx::query!(
         r#"
         INSERT INTO danmaku (time, id_str, room_id, text)
         VALUES (TO_TIMESTAMP( $1 ), $2, $3, $4)
@@ -24,15 +27,14 @@ async fn store_danmaku_to_db(
         content
     )
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn store_online_count_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     roomid: u32,
     count: i64,
-) -> Result<()> {
+) -> StdResult<PgQueryResult, sqlx::Error> {
     // BEGIN ISOLATION LEVEL SERIALIZABLE;
     // sqlx::postgres::PgAdvisoryLock
     let raw = format!(
@@ -53,15 +55,14 @@ async fn store_online_count_to_db(
         roomid, roomid, roomid, count, count
     );
 
-    let _ = sqlx::raw_sql(raw.as_str()).execute(pool).await?;
-    Ok(())
+    sqlx::raw_sql(raw.as_str()).execute(pool).await
 }
 
 async fn store_watched_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     roomid: u32,
     count: i64,
-) -> Result<()> {
+) -> StdResult<PgQueryResult, sqlx::Error> {
     let raw = format!(
         r#"
         BEGIN;
@@ -80,19 +81,47 @@ async fn store_watched_to_db(
         roomid, roomid, roomid, count, count
     );
 
-    let _ = sqlx::raw_sql(raw.as_str()).execute(pool).await?;
-    Ok(())
+    sqlx::raw_sql(raw.as_str()).execute(pool).await
 }
 
-async fn handle_msg(
-    roomid: u32,
-    msg: &LiveMessage,
+async fn store_live_status_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
-) -> Result<()> {
-    match msg {
-        LiveMessage::Message(m) => {
+    roomid: u32,
+    status: i32,
+) -> StdResult<PgQueryResult, sqlx::Error> {
+    // ON CONFLICT (room_id) DO UPDATE SET time = NOW(), status = EXCLUDED.status
+    sqlx::query!(
+        r#"
+        INSERT INTO live_status (time, room_id, status)
+        VALUES (NOW(), $1, $2)
+        "#,
+        roomid as i32,
+        status as i16
+    )
+    .execute(pool)
+    .await
+}
+
+struct LiveStatus {
+    live_status: Arc<AtomicI32>,
+    live_status_updated_at: std::time::Instant,
+}
+
+impl LiveStatus {
+    async fn handle_msg(
+        &mut self,
+        roomid: u32,
+        msg: &LiveMessage,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+    ) -> Result<()> {
+        if let LiveMessage::Message(m) = msg {
             if let Some(cmd) = m.get("cmd").and_then(|c| c.as_str()) {
                 match cmd {
+                    "LIVE" => {
+                        self.live_status.store(1, Ordering::SeqCst);
+                        println!("Live started");
+                        store_live_status_to_db(pool, roomid, 1).await?;
+                    }
                     "DANMU_MSG" => {
                         // println!("{}", m.to_string());
                         if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
@@ -118,6 +147,9 @@ async fn handle_msg(
                         }
                     }
                     "WATCHED_CHANGE" => {
+                        if self.live_status.load(Ordering::SeqCst) != 1 {
+                            return Ok(());
+                        }
                         let val = m
                             .get("data")
                             .context("Missing data field")?
@@ -128,6 +160,9 @@ async fn handle_msg(
                         store_watched_to_db(pool, roomid, val).await?;
                     }
                     "ONLINE_RANK_COUNT" => {
+                        if self.live_status.load(Ordering::SeqCst) != 1 {
+                            return Ok(());
+                        }
                         let val = m
                             .get("data")
                             .context("Missing data field")?
@@ -137,16 +172,39 @@ async fn handle_msg(
                             .context("not i64")?;
                         store_online_count_to_db(pool, roomid, val).await?;
                     }
+                    "DM_INTERACTION" => {}
+                    "ROOM_REAL_TIME_MESSAGE_UPDATE" => {}
+                    "LIKE_INFO_V3_UPDATE" => {}
                     "INTERACT_WORD_V2" => {}
                     "ONLINE_RANK_V3" => {}
                     "STOP_LIVE_ROOM_LIST" => {}
+                    "ENTRY_EFFECT" => {}
+                    "NOTICE_MSG" => {}
+                    "LOG_IN_NOTICE" => {}
                     _ => println!("Other command: {}", m.to_string()),
                 }
             }
-        }
-        _ => {}
-    };
-    Ok(())
+        };
+        Ok(())
+    }
+}
+
+async fn sync_live_status(roomid: u32) -> Result<i64> {
+    let cli = reqwest::Client::new();
+    let resp: serde_json::Value = cli
+        .get("https://api.live.bilibili.com/room/v1/Room/get_info")
+        .query(&[("room_id", roomid)])
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    resp.get("data")
+        .expect("Missing data field")
+        .get("live_status")
+        .expect("Missing live_status field")
+        .as_i64()
+        .context("live_status is not i64")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -167,9 +225,30 @@ async fn main() -> Result<()> {
 
     let mut read = msg::MsgConnection::new(roomid, key).await?;
 
+    let status_int = sync_live_status(roomid).await? as i32;
+    println!("Initial live status: {}", status_int);
+    store_live_status_to_db(&pool, roomid, status_int).await?;
+    let status_int = Arc::new(AtomicI32::new(status_int));
+
+    let mut live_status = LiveStatus {
+        live_status: status_int.clone(),
+        live_status_updated_at: std::time::Instant::now(),
+    };
+
     while let Some(m) = read.next().await {
         let m = m.context("Failed to read message")?;
-        handle_msg(roomid, &m, &pool).await?;
+        live_status.handle_msg(roomid, &m, &pool).await?;
+
+        // todo: run in different coroutine
+        if live_status.live_status_updated_at.elapsed().as_secs() > 300 {
+            let status = sync_live_status(roomid).await? as i32;
+            if status != live_status.live_status.load(Ordering::SeqCst) {
+                live_status.live_status.store(status, Ordering::SeqCst);
+                store_live_status_to_db(&pool, roomid, status).await?;
+                println!("Live status updated: {}", status);
+            }
+            live_status.live_status_updated_at = std::time::Instant::now();
+        }
     }
 
     println!("WebSocket handshake has been successfully completed");
