@@ -1,0 +1,39 @@
+name: Build
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:bookworm
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Packages
+        run: |
+          apt-get update
+          apt-get install -y postgresql-client cmake
+      - name: Prepare DB
+        run: |
+          psql --host=postgres --username=postgres --dbname=test_db --file=./initdb.sql
+      - name: Build
+        env:
+          DATABASE_URL: postgres://postgres@postgres:5432/test_db
+          DOCKER_BUILDKIT: 1
+        run: |
+          cargo fetch --target x86_64-unknown-linux-gnu
+          cargo build --frozen --all-features
