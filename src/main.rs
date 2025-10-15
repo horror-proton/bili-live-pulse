@@ -122,6 +122,11 @@ impl LiveStatus {
                         println!("Live started");
                         store_live_status_to_db(pool, roomid, 1).await?;
                     }
+                    "PREPARING" => {
+                        self.live_status.store(0, Ordering::SeqCst);
+                        println!("Live ended");
+                        store_live_status_to_db(pool, roomid, 0).await?;
+                    }
                     "DANMU_MSG" => {
                         // println!("{}", m.to_string());
                         if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
@@ -220,10 +225,13 @@ async fn main() -> Result<()> {
 
     println!("Database connected");
 
-    let roomid = 31255806;
-    let key = "";
+    let roomid = std::env::var("LIVE_ROOM_ID")
+        .unwrap()
+        .parse::<u32>()
+        .context("ROOM_ID is not a valid u32")?;
+    let key = std::env::var("LIVE_ROOM_KEY").unwrap();
 
-    let mut read = msg::MsgConnection::new(roomid, key).await?;
+    let mut read = msg::MsgConnection::new(roomid, key.as_str()).await?;
 
     let status_int = sync_live_status(roomid).await? as i32;
     println!("Initial live status: {}", status_int);

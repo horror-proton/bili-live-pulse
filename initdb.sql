@@ -1,5 +1,4 @@
 \conninfo
-\c test
 \set ECHO all
 \set ON_ERROR_STOP on
 \timing
