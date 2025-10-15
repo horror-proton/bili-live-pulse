@@ -1,5 +1,5 @@
 [package]
-name = "websocket_client"
+name = "bili-live-pulse"
 version = "0.0.1"
 edition = "2024"
 
