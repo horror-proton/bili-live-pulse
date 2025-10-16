@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS danmaku (
 );
 
 -- using first 4 chars is enough to prevent collisions
-CREATE UNIQUE   INDEX IF NOT EXISTS idx_danmaku_id_str_time ON danmaku(LEFT(id_str, 4), time);
+CREATE UNIQUE   INDEX IF NOT EXISTS idx_danmaku_id_str_time ON danmaku(id_str, time);
 CREATE          INDEX IF NOT EXISTS idx_danmaku_room_id ON danmaku(room_id);
 CREATE          INDEX IF NOT EXISTS idx_danmaku_text ON danmaku(LEFT(text, 1)); 
 

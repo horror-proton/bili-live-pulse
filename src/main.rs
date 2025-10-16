@@ -15,14 +15,15 @@ async fn store_danmaku_to_db(
     roomid: u32,
     content: &str,
 ) -> StdResult<PgQueryResult, sqlx::Error> {
+    let end = id.len().min(4);
     sqlx::query!(
         r#"
         INSERT INTO danmaku (time, id_str, room_id, text)
         VALUES (TO_TIMESTAMP( $1 ), $2, $3, $4)
-        ON CONFLICT (LEFT(id_str, 4), time) DO NOTHING
+        ON CONFLICT (id_str, time) DO NOTHING
         "#,
         ts as f64 / 1000.0,
-        id,
+        &id[..end],
         roomid as i32,
         content
     )
