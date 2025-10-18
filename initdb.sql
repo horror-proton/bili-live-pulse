@@ -63,5 +63,19 @@ CREATE TABLE IF NOT EXISTS live_status (
 
 CREATE INDEX IF NOT EXISTS idx_live_status_room_id ON live_status(room_id);
 
+-- like_info
+CREATE TABLE IF NOT EXISTS like_info (
+    "time"      TIMESTAMPTZ  NOT NULL,
+    room_id     INTEGER      NOT NULL,
+    click_count INTEGER      NOT NULL
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'time DESC'
+);
+
+CREATE INDEX IF NOT EXISTS idx_like_info_room_id ON like_info(room_id);
+
 --
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;

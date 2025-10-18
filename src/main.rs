@@ -103,6 +103,31 @@ async fn store_live_status_to_db(
     .await
 }
 
+async fn store_like_count_to_db(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    roomid: u32,
+    count: i64,
+) -> StdResult<PgQueryResult, sqlx::Error> {
+    sqlx::raw_sql(
+        format!(r#"
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('like_info'), {});
+WITH last_row AS (
+    SELECT * FROM like_info WHERE room_id = {} ORDER BY time DESC LIMIT 1
+)
+INSERT INTO like_info (time, room_id, click_count)
+SELECT NOW(), {}, {}
+WHERE NOT EXISTS (SELECT 1 FROM last_row WHERE click_count = {} AND time > NOW() - INTERVAL '5 minutes');
+COMMIT;
+            "#,
+            roomid, roomid, roomid, count, count
+        )
+        .as_str(),
+    )
+    .execute(pool)
+    .await
+}
+
 struct LiveStatus {
     live_status: Arc<AtomicI32>,
     live_status_updated_at: std::time::Instant,
@@ -177,6 +202,19 @@ impl LiveStatus {
                             .as_i64()
                             .context("not i64")?;
                         store_online_count_to_db(pool, roomid, val).await?;
+                    }
+                    "LIKE_INFO_V3_UPDATE" => {
+                        if self.live_status.load(Ordering::SeqCst) != 1 {
+                            return Ok(());
+                        }
+                        let val = m
+                            .get("data")
+                            .context("Missing data field")?
+                            .get("click_count")
+                            .context("Missing click_count field")?
+                            .as_i64()
+                            .context("not i64")?;
+                        store_like_count_to_db(pool, roomid, val).await?;
                     }
                     "DM_INTERACTION" => {}
                     "ROOM_REAL_TIME_MESSAGE_UPDATE" => {}
