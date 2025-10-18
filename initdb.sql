@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS live_status (
     tsdb.orderby = 'time DESC'
 );
 
-CREATE INDEX IF NOT EXISTS idx_live_status_room_id ON watched(room_id);
+CREATE INDEX IF NOT EXISTS idx_live_status_room_id ON live_status(room_id);
 
 --
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;
