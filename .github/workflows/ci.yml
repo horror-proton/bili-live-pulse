@@ -21,6 +21,8 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+    env:
+      DATABASE_URL: postgres://postgres@postgres:5432/test_db
 
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +34,12 @@ jobs:
         run: |
           psql --host=postgres --username=postgres --dbname=test_db --file=./initdb.sql
       - name: Build
-        env:
-          DATABASE_URL: postgres://postgres@postgres:5432/test_db
-          DOCKER_BUILDKIT: 1
         run: |
           cargo fetch --target x86_64-unknown-linux-gnu
-          cargo build --frozen --all-features
+          cargo build --frozen --all-features --verbose
+      - name: Test
+        run: |
+          cargo test --all --verbose
       - uses: actions/upload-artifact@v4
         with:
           path: target/debug/bili-live-pulse

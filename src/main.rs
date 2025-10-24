@@ -8,6 +8,9 @@ use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 mod msg;
 use msg::LiveMessage;
 
+mod model;
+use crate::model::FromMsg;
+
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
@@ -29,34 +32,6 @@ async fn store_danmaku_to_db(
     )
     .execute(pool)
     .await
-}
-
-async fn store_online_count_to_db(
-    pool: &sqlx::Pool<sqlx::Postgres>,
-    roomid: u32,
-    count: i64,
-) -> StdResult<PgQueryResult, sqlx::Error> {
-    // BEGIN ISOLATION LEVEL SERIALIZABLE;
-    // sqlx::postgres::PgAdvisoryLock
-    let raw = format!(
-        r#"
-        BEGIN;
-        SELECT pg_advisory_xact_lock(hashtext('online_rank_count'), {});
-        WITH last_row AS (
-            SELECT * FROM online_rank_count
-            WHERE room_id = {}
-            ORDER BY time DESC
-            LIMIT 1
-        )
-        INSERT INTO online_rank_count (time, room_id, count)
-        SELECT NOW(), {}, {}
-        WHERE NOT EXISTS (SELECT 1 FROM last_row WHERE count = {} AND time > NOW() - INTERVAL '5 minutes');
-        COMMIT;
-        "#,
-        roomid, roomid, roomid, count, count
-    );
-
-    sqlx::raw_sql(raw.as_str()).execute(pool).await
 }
 
 async fn store_watched_to_db(
@@ -98,31 +73,6 @@ async fn store_live_status_to_db(
         "#,
         roomid as i32,
         status as i16
-    )
-    .execute(pool)
-    .await
-}
-
-async fn store_like_count_to_db(
-    pool: &sqlx::Pool<sqlx::Postgres>,
-    roomid: u32,
-    count: i64,
-) -> StdResult<PgQueryResult, sqlx::Error> {
-    sqlx::raw_sql(
-        format!(r#"
-BEGIN;
-SELECT pg_advisory_xact_lock(hashtext('like_info'), {});
-WITH last_row AS (
-    SELECT * FROM like_info WHERE room_id = {} ORDER BY time DESC LIMIT 1
-)
-INSERT INTO like_info (time, room_id, click_count)
-SELECT NOW(), {}, {}
-WHERE NOT EXISTS (SELECT 1 FROM last_row WHERE click_count = {} AND time > NOW() - INTERVAL '5 minutes');
-COMMIT;
-            "#,
-            roomid, roomid, roomid, count, count
-        )
-        .as_str(),
     )
     .execute(pool)
     .await
@@ -194,27 +144,15 @@ impl LiveStatus {
                         if self.live_status.load(Ordering::SeqCst) != 1 {
                             return Ok(());
                         }
-                        let val = m
-                            .get("data")
-                            .context("Missing data field")?
-                            .get("count")
-                            .context("Missing count field")?
-                            .as_i64()
-                            .context("not i64")?;
-                        store_online_count_to_db(pool, roomid, val).await?;
+                        let record = model::OnlineCount::from_msg(roomid, m)?;
+                        model::insert_struct(pool, &record).await?;
                     }
                     "LIKE_INFO_V3_UPDATE" => {
                         if self.live_status.load(Ordering::SeqCst) != 1 {
                             return Ok(());
                         }
-                        let val = m
-                            .get("data")
-                            .context("Missing data field")?
-                            .get("click_count")
-                            .context("Missing click_count field")?
-                            .as_i64()
-                            .context("not i64")?;
-                        store_like_count_to_db(pool, roomid, val).await?;
+                        let record = model::LikeInfo::from_msg(roomid, m)?;
+                        model::insert_struct(pool, &record).await?;
                     }
                     "DM_INTERACTION" => {}
                     "ROOM_REAL_TIME_MESSAGE_UPDATE" => {}
