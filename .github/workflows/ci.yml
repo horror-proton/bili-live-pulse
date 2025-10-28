@@ -23,6 +23,9 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgres://postgres@postgres:5432/test_db
+      CARGO_TERM_VERBOSE: true
+      CARGO_TERM_COLOR: always
+      CARGO_TERM_UNICODE: true
 
     steps:
       - uses: actions/checkout@v4

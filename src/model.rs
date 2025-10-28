@@ -29,7 +29,6 @@ pub struct OnlineCount {
 impl FromMsg for OnlineCount {
     fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self> {
         let room_id = room_id as i32;
-        // TODO: online_count?
         let count = m
             .get("data")
             .context("Missing data field")?
@@ -109,6 +108,52 @@ impl Insertable for LikeInfo {
             "#,
             self.room_id,
             self.click_count
+        )
+    }
+}
+
+pub struct Watched {
+    room_id: i32,
+    num: i32,
+}
+
+impl FromMsg for Watched {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let num = m
+            .get("data")
+            .context("Missing data field")?
+            .get("num")
+            .context("Missing num field")?
+            .as_i64()
+            .context("not i64")? as i32;
+
+        Ok(Watched { room_id, num })
+    }
+}
+
+impl Insertable for Watched {
+    fn build_query(&self) -> PgQuery<'_> {
+        query!(
+            r#"
+            INSERT INTO watched (time, room_id, num)
+            SELECT NOW(), $1, $2
+            WHERE
+                pg_try_advisory_xact_lock(hashtext('watched'), $1)
+            AND NOT COALESCE((
+                SELECT num = $2
+                FROM watched
+                WHERE room_id = $1
+                AND time > NOW() - INTERVAL '5 minutes'
+                ORDER BY time DESC
+                LIMIT 1
+            ), FALSE)
+            "#,
+            self.room_id,
+            self.num
         )
     }
 }
