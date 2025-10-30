@@ -122,6 +122,10 @@ impl LiveStatus {
                         let record = model::LikeInfo::from_msg(room_id, m)?;
                         model::insert_struct(pool, &record).await?;
                     }
+                    "ROOM_CHANGE" => {
+                        let record = model::RoomInfo::from_msg(room_id, m)?;
+                        model::insert_struct(pool, &record).await?;
+                    }
                     "DM_INTERACTION" => {}
                     "ROOM_REAL_TIME_MESSAGE_UPDATE" => {}
                     "LIKE_INFO_V3_UPDATE" => {}
