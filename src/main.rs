@@ -139,7 +139,7 @@ impl LiveStatus {
     }
 }
 
-async fn sync_live_status(room_id: u32) -> Result<i64> {
+async fn get_api_live_status(room_id: u32) -> Result<model::RoomInfo> {
     let cli = reqwest::Client::new();
     let resp: serde_json::Value = cli
         .get("https://api.live.bilibili.com/room/v1/Room/get_info")
@@ -149,12 +149,7 @@ async fn sync_live_status(room_id: u32) -> Result<i64> {
         .json()
         .await?;
 
-    resp.get("data")
-        .expect("Missing data field")
-        .get("live_status")
-        .expect("Missing live_status field")
-        .as_i64()
-        .context("live_status is not i64")
+    model::RoomInfo::from_api_result(room_id, &resp)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -178,7 +173,9 @@ async fn main() -> Result<()> {
 
     let mut read = msg::MsgConnection::new(room_id, key.as_str()).await?;
 
-    let status_int = sync_live_status(room_id).await? as i32;
+    let room_info = get_api_live_status(room_id).await?;
+    model::insert_struct(&pool, &room_info).await?;
+    let status_int = room_info.live_status.unwrap() as i32;
     println!("Initial live status: {}", status_int);
     store_live_status_to_db(&pool, room_id, status_int).await?;
     let status_int = Arc::new(AtomicI32::new(status_int));
@@ -194,7 +191,8 @@ async fn main() -> Result<()> {
 
         // todo: run in different coroutine
         if live_status.live_status_updated_at.elapsed().as_secs() > 300 {
-            let status = sync_live_status(room_id).await? as i32;
+            let room_info = get_api_live_status(room_id).await?;
+            let status = room_info.live_status.unwrap() as i32;
             if status != live_status.live_status.load(Ordering::SeqCst) {
                 live_status.live_status.store(status, Ordering::SeqCst);
                 store_live_status_to_db(&pool, room_id, status).await?;

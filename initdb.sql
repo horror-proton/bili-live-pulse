@@ -78,4 +78,22 @@ CREATE TABLE IF NOT EXISTS like_info (
 CREATE INDEX IF NOT EXISTS idx_like_info_room_id ON like_info(room_id);
 
 --
+CREATE TABLE IF NOT EXISTS room_info (
+    "time"              TIMESTAMPTZ     NOT NULL,
+    room_id             INTEGER         NOT NULL,
+    area_id             INTEGER         NOT NULL,
+    area_name           TEXT            NOT NULL,
+    parent_area_id      INTEGER         NOT NULL,
+    parent_area_name    TEXT            NOT NULL,
+    title               TEXT            NOT NULL
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'time DESC'
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_info_room_id ON room_info(room_id);
+
+--
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;
