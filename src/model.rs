@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use serde::Deserialize;
+use sqlx::PgTransaction;
 use sqlx::postgres::PgQueryResult;
 use sqlx::query::Query;
 use sqlx::{Execute, PgPool, query};
@@ -49,12 +50,15 @@ impl FromMsg for RoomInfo {
 
 impl Insertable for RoomInfo {
     fn build_query(&self) -> PgQuery<'_> {
+        // do not count on evaluation order of AND, use CTE here
+        // https://www.postgresql.org/docs/18/sql-expressions.html#SYNTAX-EXPRESS-EVAL
         query!(
             r#"
+            WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('room_info'), $1) AS got)
             INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title)
             SELECT NOW(), $1, $2, $3, $4, $5, $6
             WHERE
-                pg_try_advisory_xact_lock(hashtext('room_info'), $1)
+                (SELECT got FROM lock)
             AND NOT COALESCE((
                 SELECT area_id = $2
                 AND area_name = $3
@@ -107,10 +111,11 @@ impl Insertable for OnlineCount {
     fn build_query(&self) -> PgQuery<'_> {
         query!(
             r#"
+            WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('online_rank_count'), $1) AS got)
             INSERT INTO online_rank_count (time, room_id, count)
             SELECT NOW(), $1, $2
             WHERE
-                pg_try_advisory_xact_lock(hashtext('online_rank_count'), $1)
+                (SELECT got FROM lock)
             AND NOT COALESCE((
                 SELECT count = $2
                 FROM online_rank_count
@@ -149,10 +154,11 @@ impl Insertable for LikeInfo {
     fn build_query(&self) -> PgQuery<'_> {
         query!(
             r#"
+            WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('like_info'), $1) AS got)
             INSERT INTO like_info (time, room_id, click_count)
             SELECT NOW(), $1, $2
             WHERE
-                pg_try_advisory_xact_lock(hashtext('like_info'), $1)
+                (SELECT got FROM lock)
             AND NOT COALESCE((
                 SELECT click_count = $2
                 FROM like_info
@@ -191,10 +197,11 @@ impl Insertable for Watched {
     fn build_query(&self) -> PgQuery<'_> {
         query!(
             r#"
+            WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('watched'), $1) AS got)
             INSERT INTO watched (time, room_id, num)
             SELECT NOW(), $1, $2
             WHERE
-                pg_try_advisory_xact_lock(hashtext('watched'), $1)
+                (SELECT got FROM lock)
             AND NOT COALESCE((
                 SELECT num = $2
                 FROM watched
@@ -214,7 +221,7 @@ async fn begin_roomid_lock(
     pool: &PgPool,
     table: &str,
     room_id: u32,
-) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+) -> std::result::Result<PgTransaction<'static>, sqlx::Error> {
     let lock_stmt = query!(
         "SELECT pg_advisory_xact_lock(hashtext($1), $2)",
         table,
