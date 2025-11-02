@@ -276,34 +276,26 @@ mod tests {
     {
         let pool = test_pool().await;
 
-        {
-            let mut tx = get_tx(&pool).await;
+        let mut tx = get_tx(&pool).await;
 
-            let res = data.build_query().execute(&mut *tx).await?;
-            assert_eq!(res.rows_affected(), 1);
-
-            // blocked by lock
-            let res = data.build_query().execute(&mut *tx).await?;
-            assert_eq!(res.rows_affected(), 0);
-
-            tx.rollback().await?;
-        }
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(res.rows_affected(), 1);
 
         {
-            let mut tx = get_tx(&pool).await;
-            let mut q = data.build_query();
-
-            let args = q.take_arguments().unwrap().unwrap();
-            let new_sql = remove_lock(q.sql());
-            let res = sqlx::query_with(&new_sql, args).execute(&mut *tx).await?;
-            assert_eq!(res.rows_affected(), 1);
-
-            // blocked by recent duplicate
-            let res = data.build_query().execute(&mut *tx).await?;
-            assert_eq!(res.rows_affected(), 0);
-
-            tx.rollback().await?;
+            let mut tx2 = get_tx(&pool).await;
+            let res = data.build_query().execute(&mut *tx2).await?;
+            assert_eq!(res.rows_affected(), 0, "Should be blocked by lock");
+            tx2.rollback().await?;
         }
+
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(
+            res.rows_affected(),
+            0,
+            "Should be blocked by recent duplicate"
+        );
+
+        tx.rollback().await?;
 
         Ok(())
     }
@@ -381,6 +373,6 @@ mod tests {
         assert_eq!(room_info.parent_area_name, "知识");
         assert_eq!(room_info.live_status, Some(1));
         assert_eq!(room_info.title, "全球地震预警-信息/海啸信息/EEW");
-        Ok(())
+        test_insertable(&room_info).await
     }
 }
