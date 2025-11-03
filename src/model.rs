@@ -217,6 +217,48 @@ impl Insertable for Watched {
     }
 }
 
+#[derive(Deserialize)]
+pub struct Guard {
+    #[serde(skip)]
+    room_id: i32,
+
+    start_time: i64,
+    guard_level: i16,
+    num: i32,
+    uid: i64,
+    username: String,
+}
+
+impl FromMsg for Guard {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let data = m.get("data").context("Missing data field")?;
+        let result = Self::deserialize(data)?;
+        Ok(Self { room_id, ..result })
+    }
+}
+
+impl Insertable for Guard {
+    fn build_query(&self) -> PgQuery<'_> {
+        query!(
+            r#"
+            INSERT INTO guard (time, room_id, guard_level, num, uid, username)
+            VALUES (TO_TIMESTAMP($1), $2, $3, $4, $5, $6)
+            ON CONFLICT (time, uid) DO NOTHING
+            "#,
+            self.start_time as f64,
+            self.room_id,
+            self.guard_level,
+            self.num,
+            self.uid,
+            self.username,
+        )
+    }
+}
+
 async fn begin_roomid_lock(
     pool: &PgPool,
     table: &str,
@@ -365,8 +407,8 @@ mod tests {
             "area_name": "科技·科学",
           }
         });
-        let room_info = RoomInfo::from_api_result(31255806, &ret)?;
-        assert_eq!(room_info.room_id, 31255806);
+        let room_info = RoomInfo::from_api_result(12345, &ret)?;
+        assert_eq!(room_info.room_id, 12345);
         assert_eq!(room_info.area_id, 701);
         assert_eq!(room_info.area_name, "科技·科学");
         assert_eq!(room_info.parent_area_id, 11);
@@ -374,5 +416,45 @@ mod tests {
         assert_eq!(room_info.live_status, Some(1));
         assert_eq!(room_info.title, "全球地震预警-信息/海啸信息/EEW");
         test_insertable(&room_info).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_watched() -> Result<()> {
+        let ret = json!({"cmd":"WATCHED_CHANGE","data":{"num":608,"text_large":"608人看过","text_small":"608"}});
+        let data = Watched::from_msg(12345, &ret)?;
+        assert_eq!(data.num, 608);
+        test_insertable(&data).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_guard() -> Result<()> {
+        let ret = json!({
+          "cmd": "GUARD_BUY",
+          "data": {
+            "uid": 14225357,
+            "username": "妙妙喵喵妙妙喵O_O",
+            "guard_level": 3,
+            "num": 1,
+            "price": 198000,
+            "gift_id": 10003,
+            "gift_name": "舰长",
+            "start_time": 1677069316,
+            "end_time": 1677069316
+          }
+        });
+        let data = Guard::from_msg(12345, &ret)?;
+
+        let pool = test_pool().await;
+
+        let mut tx = get_tx(&pool).await;
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(res.rows_affected(), 1);
+        let res = data.build_query().execute(&mut *tx).await?;
+
+        assert_eq!(res.rows_affected(), 0, "Should be blocked by conflict");
+        tx.rollback().await?;
+        Ok(())
     }
 }

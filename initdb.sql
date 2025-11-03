@@ -96,4 +96,23 @@ CREATE TABLE IF NOT EXISTS room_info (
 CREATE INDEX IF NOT EXISTS idx_room_info_room_id ON room_info(room_id);
 
 --
+
+CREATE TABLE IF NOT EXISTS guard (
+    "time"      TIMESTAMPTZ NOT NULL,
+    room_id     INTEGER     NOT NULL,
+    guard_level SMALLINT    NOT NULL,
+    num         INTEGER     NOT NULL,
+    "uid"       BIGINT      NOT NULL,
+    "username" TEXT        NOT NULL
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'time DESC'
+);
+
+CREATE INDEX IF NOT EXISTS idx_guard_room_id ON guard(room_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_guard_time_uid ON guard(time, "uid");
+
+--
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;

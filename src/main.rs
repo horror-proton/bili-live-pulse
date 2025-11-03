@@ -101,6 +101,10 @@ impl LiveStatus {
                             }
                         }
                     }
+                    "GUARD_BUY" => {
+                        let record = model::Guard::from_msg(room_id, m)?;
+                        model::insert_struct(pool, &record).await?;
+                    }
                     "WATCHED_CHANGE" => {
                         if self.live_status.load(Ordering::SeqCst) != 1 {
                             return Ok(());
@@ -123,6 +127,7 @@ impl LiveStatus {
                         model::insert_struct(pool, &record).await?;
                     }
                     "ROOM_CHANGE" => {
+                        println!("Room info changed {}", m);
                         let record = model::RoomInfo::from_msg(room_id, m)?;
                         model::insert_struct(pool, &record).await?;
                     }
