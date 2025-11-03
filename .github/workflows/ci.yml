@@ -1,5 +1,14 @@
 name: Build
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Build and upload image'
+        type: boolean
+        required: false
+        default: 'false'
 
 jobs:
   build:
@@ -36,6 +45,13 @@ jobs:
       - name: Prepare DB
         run: |
           psql --host=postgres --username=postgres --dbname=test_db --file=./initdb.sql
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
       - name: Build
         run: |
           cargo fetch --target x86_64-unknown-linux-gnu
@@ -46,3 +62,93 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           path: target/debug/bili-live-pulse
+
+  build-image:
+    if: ${{ github.ref == 'refs/heads/master' || github.event.inputs.image == true }}
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - uses: actions/download-artifact@v5
+      - name: Build Container
+        run: |
+          chmod +x bili-live-pulse
+          ls -lah
+
+          cat <<EOF > Dockerfile
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y openssl ca-certificates
+          COPY bili-live-pulse /usr/local/bin/bili-live-pulse
+          ENTRYPOINT ["/usr/local/bin/bili-live-pulse"]
+          EOF
+
+          tag=runs-${{ github.run_id }}
+
+          docker build -t bili-live-pulse:$tag .
+
+          sha=$(docker inspect --format='{{.Id}}' bili-live-pulse:$tag)
+
+          echo "IMAGE_TAG=$tag" >> $GITHUB_STEP_SUMMARY
+          echo "IMAGE_SHA=$sha" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "docker service update --image bili-live-pulse:$tag <your_service>" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          set -o pipefail
+          docker save bili-live-pulse:$tag | gzip > bili-live-pulse.tar.gz
+      - uses: actions/upload-artifact@v5
+        with:
+          name: image
+          path: bili-live-pulse.tar.gz
+
+      - name: Smoke Test
+        run: |
+          echo "TODO"
+
+  upload:
+    runs-on: ubuntu-latest
+    needs:
+      - build-image
+    strategy:
+      matrix:
+        include:
+          - remote: "remote"
+    steps:
+      - uses: actions/download-artifact@v5
+      - name: Write ssh config
+        run: |
+          cd `bash -c "echo ~$(whoami)"`
+
+          mkdir -p .ssh
+
+          cat <<EOF > .ssh/identity
+          ${{ secrets.SSH_KEY }}
+          EOF
+
+          cat <<EOF > .ssh/config
+          ${{ secrets.SSH_CONFIG }}
+          EOF
+
+          sudo tee /etc/ssh/ssh_config <<EOF
+          Host *
+              # StrictHostKeyChecking accept-new
+              IdentityFile ~/.ssh/identity
+          EOF
+
+          cat <<EOF >> .ssh/known_hosts
+          ${{ vars.known_hosts }}
+          EOF
+
+          sudo chmod 600 -R .ssh
+          sudo chmod 700 .ssh
+
+          ssh ${{ matrix.remote }} hostnamectl status
+
+      - name: Distribute Image
+        run: |
+          ls -lah
+          # scp -C bili-live-pulse.tar.gz ${{ matrix.remote }}:/dev/shm
+
+          ssh ${{ matrix.remote }} docker images bili-live-pulse || true
+
+          ssh ${{ matrix.remote }} "docker load" < ./image/bili-live-pulse.tar.gz
