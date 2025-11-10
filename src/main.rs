@@ -96,8 +96,8 @@ impl LiveStatus {
                                     .context("id_str is not a string")?
                                     .to_string();
                                 let content = info[1].as_str().unwrap_or("");
-                                println!("{}: {}: {}", ts, id, content);
-                                store_danmaku_to_db(pool, ts, id.as_str(), room_id, content).await?;
+                                store_danmaku_to_db(pool, ts, id.as_str(), room_id, content)
+                                    .await?;
                             }
                         }
                     }
