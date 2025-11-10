@@ -23,7 +23,7 @@ pub trait Insertable {
     fn build_query(&self) -> PgQuery<'_>;
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct RoomInfo {
     #[serde(skip)]
     room_id: i32,
@@ -67,7 +67,7 @@ impl Insertable for RoomInfo {
                 AND title = $6
                 FROM room_info
                 WHERE room_id = $1
-                AND time > NOW() - INTERVAL '5 minutes'
+                AND time > NOW() - INTERVAL '60 minutes'
                 ORDER BY time DESC
                 LIMIT 1
             ), FALSE)

@@ -207,6 +207,13 @@ async fn main() -> Result<()> {
                 store_live_status_to_db(&pool, room_id, status).await?;
                 println!("Live status updated: {}", status);
             }
+            if model::insert_struct(&pool, &room_info)
+                .await?
+                .rows_affected()
+                > 0
+            {
+                println!("Room info updated {:?}", room_info);
+            }
             live_status.live_status_updated_at = std::time::Instant::now();
         }
     }
