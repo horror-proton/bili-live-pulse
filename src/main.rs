@@ -11,6 +11,8 @@ use msg::LiveMessage;
 mod model;
 use crate::model::FromMsg;
 
+mod wbi;
+
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
@@ -178,7 +180,13 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<u32>()
         .context("ROOM_ID is not a valid u32")?;
-    let key = std::env::var("LIVE_ROOM_KEY").unwrap();
+
+    let key = if let Ok(env_key) = std::env::var("LIVE_ROOM_KEY") {
+        env_key
+    } else {
+        println!("Fetching room key from API...");
+        msg::get_room_key(room_id).await?
+    };
 
     let mut read = msg::MsgConnection::new(room_id, key.as_str()).await?;
 

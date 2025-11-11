@@ -13,6 +13,45 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol;
 
+use crate::wbi;
+
+#[derive(serde::Deserialize)]
+struct DanmuInfoResult {
+    data: DanmuInfoResultData,
+}
+
+#[derive(serde::Deserialize)]
+struct DanmuInfoResultData {
+    token: String,
+}
+
+pub async fn get_room_key(roomid: u32) -> Result<String> {
+    let keys = wbi::get_wbi_keys().await?;
+
+    let params = wbi::encode_wbi(
+        vec![
+            ("id", roomid.to_string()),
+            ("type", "0".to_string()),
+            ("web_location", "444.8".to_string()),
+        ],
+        keys,
+    );
+
+    let url = format!(
+        "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?{}",
+        params
+    );
+
+    let res = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await?
+        .json::<DanmuInfoResult>()
+        .await?;
+
+    Ok(res.data.token)
+}
+
 pub enum Operation {
     Heartbeat = 2,
     HeartbeatReply = 3,
