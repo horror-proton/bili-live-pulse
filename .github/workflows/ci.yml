@@ -111,8 +111,7 @@ jobs:
       - build-image
     strategy:
       matrix:
-        include:
-          - remote: "remote"
+        remote: [ceaf, a52b]
     steps:
       - uses: actions/download-artifact@v5
       - name: Write ssh config
