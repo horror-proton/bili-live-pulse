@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
+use tokio::sync::mpsc;
 
 mod msg;
 use msg::LiveMessage;
@@ -188,7 +189,11 @@ async fn main() -> Result<()> {
         msg::get_room_key(room_id).await?
     };
 
-    let mut read = msg::MsgConnection::new(room_id, key.as_str()).await?;
+    let (message_tx, mut message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
+
+    let mut conn = msg::MsgConnection::new(room_id, key.as_str(), message_tx).await?;
+
+    let consumer_handle = tokio::spawn(async move { conn.start().await });
 
     let room_info = get_api_live_status(room_id).await?;
     model::insert_struct(&pool, &room_info).await?;
@@ -202,8 +207,7 @@ async fn main() -> Result<()> {
         live_status_updated_at: std::time::Instant::now(),
     };
 
-    while let Some(m) = read.next().await {
-        let m = m.context("Failed to read message")?;
+    while let Some(m) = message_rx.recv().await {
         live_status.handle_msg(room_id, &m, &pool).await?;
 
         // todo: run in different coroutine
@@ -227,5 +231,7 @@ async fn main() -> Result<()> {
     }
 
     println!("WebSocket handshake has been successfully completed");
+
+    consumer_handle.await??;
     Ok(())
 }

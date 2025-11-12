@@ -8,6 +8,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
@@ -246,30 +247,36 @@ fn build_packet(message: Vec<u8>, operation: u32, sequence: u32) -> Vec<u8> {
 
 pub struct MsgConnection {
     read_stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    sequence: AtomicU32,
-    heartbeat_coroutine: tokio::task::JoinHandle<
-        futures_util::stream::SplitSink<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            protocol::Message,
-        >,
+    write_stream: futures_util::stream::SplitSink<
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        protocol::Message,
     >,
+    sequence: AtomicU32,
     heartbeat_pending: Arc<AtomicBool>,
-    live_messages: Vec<LiveMessage>,
+    message_tx: mpsc::Sender<LiveMessage>,
 }
 
 impl MsgConnection {
-    pub async fn new(roomid: u32, key: &str) -> Result<Self> {
+    pub async fn new(
+        roomid: u32,
+        key: &str,
+        message_tx: mpsc::Sender<LiveMessage>,
+    ) -> Result<Self> {
+        use reqwest::header::{
+            CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE, USER_AGENT,
+        };
+
         let url = "wss://broadcastlv.chat.bilibili.com:443/sub";
         let req = Request::builder()
             .method("GET")
             .uri(url)
-            .header("Host", "broadcastlv.chat.bilibili.com")
-            .header("Upgrade", "websocket")
-            .header("Connection", "Upgrade")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", "chat")
+            .header(HOST, "broadcastlv.chat.bilibili.com")
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "Upgrade")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, "chat")
             .header(
-                "User-Agent",
+                USER_AGENT,
                 "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
             )
             .body(())
@@ -300,82 +307,68 @@ impl MsgConnection {
 
         let heartbeat_pending = Arc::new(AtomicBool::new(false));
 
-        let p = Arc::clone(&heartbeat_pending);
-        let heartbeat_coroutine = tokio::spawn(async move {
-            loop {
-                if p.load(SeqCst) {
-                    eprintln!("Heartbeat reply not received, connection may be dead");
-                    break;
-                }
-                let heartbeat_packet = LiveMessage::new_heartbeat().serialize();
-                if let Err(e) = write
-                    .send(protocol::Message::binary(heartbeat_packet))
-                    .await
-                {
-                    eprintln!("Failed to send heartbeat: {:?}", e);
-                    break;
-                }
-                p.store(true, SeqCst);
-                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
-            }
-            write
-        });
-
         Ok(MsgConnection {
             read_stream,
+            write_stream: write,
             sequence: AtomicU32::new(1),
-            heartbeat_coroutine,
-            live_messages: Vec::new(),
             heartbeat_pending,
+            message_tx,
         })
     }
 
-    pub async fn next(&mut self) -> Option<Result<LiveMessage>> {
-        if !self.live_messages.is_empty() {
-            return Some(Ok(self.live_messages.remove(0)));
+    async fn forward_one(&mut self, pmsg: protocol::Message) -> Result<()> {
+        let bin = match pmsg {
+            protocol::Message::Binary(b) => b,
+            _ => return Ok(()),
+        };
+
+        for (data, op) in decompress_packet(&bin)? {
+            let live_msg = LiveMessage::from_payload(&data, op);
+
+            if let LiveMessage::HeartbeatReply(_) = &live_msg {
+                // println!("Received heartbeat reply");
+                self.handle_heartbeat_reply();
+            }
+
+            self.message_tx.send(live_msg).await?;
         }
 
-        tokio::select! {
-            biased;
+        Ok(())
+    }
 
-            _ = &mut self.heartbeat_coroutine => {
-                    return Some(Err(anyhow::anyhow!("Heartbeat coroutine has finished, connection may be dead")));
+    pub async fn start(&mut self) -> Result<()> {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+        loop {
+            tokio::select! {
+                msg = self.read_stream.next() => {
+                    // let msg: Option<std::result::Result<protocol::Message, tokio_tungstenite::tungstenite::Error>> = msg;
+                    let pmsg = match msg {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            return Err(anyhow::anyhow!("WebSocket read error: {:?}", e));
+                        }
+                        None => break,
+                    };
+
+                    self.forward_one(pmsg).await?;
                 },
 
-            msg = self.read_stream.next() =>
-                match msg? {
-                    Ok(protocol::Message::Binary(bin)) => {
-                        match decompress_packet(&bin).context("Failed to decompress packet") {
-                            Ok(decompressed) => {
-                                self.live_messages = decompressed
-                                    .iter()
-                                    .map(|(data, op)| LiveMessage::from_payload(data, *op))
-                                    .collect::<Vec<_>>();
-                                if !self.live_messages.is_empty() {
-                                    let first = self.live_messages.remove(0);
-                                    if let LiveMessage::HeartbeatReply((_, _)) = &first {
-                                        self.handle_heartbeat_reply();
-                                    }
-                                    return Some(Ok(first));
-                                }
-                                return Some(Ok(LiveMessage::Unknown));
-                            }
-                            Err(e) => return Some(Err(e)),
-                        }
+                _ = interval.tick() => {
+                    let heartbeat_packet = LiveMessage::new_heartbeat().serialize();
+                    if let Err(e) = self.write_stream
+                        .send(protocol::Message::binary(heartbeat_packet))
+                        .await
+                    {
+                        return Err(anyhow::anyhow!("Failed to send heartbeat: {:?}", e));
                     }
-                    Ok(_) => return Some(Ok(LiveMessage::Unknown)),
-                    Err(e) => return Some(Err(anyhow::anyhow!(e))),
-                }
-        };
+                },
+            }
+        }
+
+        Ok(())
     }
 
     fn handle_heartbeat_reply(&self) {
         self.heartbeat_pending.store(false, SeqCst);
-    }
-}
-
-impl Drop for MsgConnection {
-    fn drop(&mut self) {
-        self.heartbeat_coroutine.abort();
     }
 }
