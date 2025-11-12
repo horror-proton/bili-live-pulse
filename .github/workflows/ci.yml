@@ -110,9 +110,9 @@ jobs:
     needs:
       - build-image
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - remote: "remote"
+        remote: ${{ fromJSON(vars.REMOTES) }}
     steps:
       - uses: actions/download-artifact@v5
       - name: Write ssh config
