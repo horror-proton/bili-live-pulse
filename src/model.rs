@@ -259,6 +259,52 @@ impl Insertable for Guard {
     }
 }
 
+#[derive(Deserialize)]
+pub struct RealTimeMessage {
+    #[serde(skip)]
+    room_id: i32,
+
+    fans: i32,
+    fans_club: i32,
+}
+
+impl FromMsg for RealTimeMessage {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let data = m.get("data").context("Missing data field")?;
+        let result = Self::deserialize(data)?;
+        Ok(Self { room_id, ..result })
+    }
+}
+
+impl Insertable for RealTimeMessage {
+    fn build_query(&self) -> PgQuery<'_> {
+        query!(
+            r#"
+            WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('watched'), $1) AS got)
+            INSERT INTO real_time_message (time, room_id, fans, fans_club)
+            SELECT NOW(), $1, $2, $3
+            WHERE
+                (SELECT got FROM lock)
+            AND NOT COALESCE((
+                SELECT fans = $2
+                AND fans_club = $3
+                FROM real_time_message
+                WHERE room_id = $1
+                AND time > NOW() - INTERVAL '5 minutes'
+                ORDER BY time DESC
+                LIMIT 1
+            ), FALSE)
+            "#,
+            self.room_id,
+            self.fans,
+            self.fans_club
+        )
+    }
+}
 async fn begin_roomid_lock(
     pool: &PgPool,
     table: &str,
@@ -455,6 +501,17 @@ mod tests {
 
         assert_eq!(res.rows_affected(), 0, "Should be blocked by conflict");
         tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_real_time_message() -> Result<()> {
+        let ret = json!({"cmd":"ROOM_REAL_TIME_MESSAGE_UPDATE","data":{"fans":691456,"fans_club":3806,"red_notice":-1,"roomid":12345}});
+        let data = RealTimeMessage::from_msg(12345, &ret)?;
+        assert_eq!(data.fans, 691456);
+        assert_eq!(data.fans_club, 3806);
+        test_insertable(&data).await?;
         Ok(())
     }
 }

@@ -115,4 +115,20 @@ CREATE INDEX IF NOT EXISTS idx_guard_room_id ON guard(room_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_guard_time_uid ON guard(time, "uid");
 
 --
+
+CREATE TABLE IF NOT EXISTS real_time_message (
+    "time"      TIMESTAMPTZ NOT NULL,
+    room_id     INTEGER     NOT NULL,
+    fans        INTEGER     NOT NULL,
+    fans_club   INTEGER     NOT NULL
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'time DESC'
+);
+
+CREATE INDEX IF NOT EXISTS idx_real_time_message_room_id ON real_time_message(room_id);
+
+--
 SELECT * FROM timescaledb_information.hypertable_columnstore_settings;

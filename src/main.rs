@@ -134,8 +134,11 @@ impl LiveStatus {
                         let record = model::RoomInfo::from_msg(room_id, m)?;
                         model::insert_struct(pool, &record).await?;
                     }
+                    "ROOM_REAL_TIME_MESSAGE_UPDATE" => {
+                        let record = model::RealTimeMessage::from_msg(room_id, m)?;
+                        model::insert_struct(pool, &record).await?;
+                    }
                     "DM_INTERACTION" => {}
-                    "ROOM_REAL_TIME_MESSAGE_UPDATE" => {}
                     "LIKE_INFO_V3_UPDATE" => {}
                     "INTERACT_WORD_V2" => {}
                     "ONLINE_RANK_V3" => {}
