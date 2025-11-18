@@ -34,6 +34,7 @@ pub struct RoomInfo {
     parent_area_name: String,
     pub live_status: Option<i16>,
     title: String,
+    up_session: Option<String>,
 }
 
 impl FromMsg for RoomInfo {
@@ -55,16 +56,15 @@ impl Insertable for RoomInfo {
         query!(
             r#"
             WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('room_info'), $1) AS got)
-            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title)
-            SELECT NOW(), $1, $2, $3, $4, $5, $6
+            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title, live_id_str)
+            SELECT NOW(), $1, $2, $3, $4, $5, $6, $7
             WHERE
                 (SELECT got FROM lock)
             AND NOT COALESCE((
                 SELECT area_id = $2
-                AND area_name = $3
                 AND parent_area_id = $4
-                AND parent_area_name = $5
                 AND title = $6
+                AND live_id_str IS NOT DISTINCT FROM $7
                 FROM room_info
                 WHERE room_id = $1
                 AND time > NOW() - INTERVAL '60 minutes'
@@ -77,7 +77,8 @@ impl Insertable for RoomInfo {
             self.area_name,
             self.parent_area_id,
             self.parent_area_name,
-            self.title
+            self.title,
+            self.up_session,
         )
     }
 }

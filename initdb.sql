@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS room_info (
     area_name           TEXT            NOT NULL,
     parent_area_id      INTEGER         NOT NULL,
     parent_area_name    TEXT            NOT NULL,
-    title               TEXT            NOT NULL
+    title               TEXT            NOT NULL,
+    live_id_str         TEXT
 ) WITH (
     tsdb.hypertable,
     tsdb.partition_column = 'time',
