@@ -167,6 +167,74 @@ async fn get_api_live_status(room_id: u32) -> Result<model::RoomInfo> {
     model::RoomInfo::from_api_result(room_id, &resp)
 }
 
+struct RoomWatch {
+    room_id: u32,
+    key: String,
+
+    pool: sqlx::Pool<sqlx::Postgres>,
+    live_status: LiveStatus,
+}
+
+impl RoomWatch {
+    pub async fn new(room_id: u32, pool: sqlx::Pool<sqlx::Postgres>) -> Result<Self> {
+        let key = msg::get_room_key(room_id).await?;
+        let live_status = LiveStatus {
+            live_status: Arc::new(AtomicI32::new(0)),
+            live_status_updated_at: std::time::Instant::now(),
+        };
+        Ok(Self {
+            room_id,
+            key,
+            pool,
+            live_status,
+        })
+    }
+
+    async fn concile_status(&mut self) -> Result<model::RoomInfo> {
+        let room_info = get_api_live_status(self.room_id).await?;
+
+        println!("Fetched room info from API {:?}", room_info);
+
+        let status = room_info.live_status.unwrap() as i32;
+        if status as i32 != self.live_status.live_status.load(Ordering::SeqCst) {
+            self.live_status.live_status.store(status, Ordering::SeqCst);
+            store_live_status_to_db(&self.pool, self.room_id, status).await?;
+        }
+        model::insert_struct(&self.pool, &room_info).await?;
+
+        self.live_status.live_status_updated_at = std::time::Instant::now();
+        Ok(room_info)
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let (message_tx, mut message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
+        let mut conn = msg::MsgConnection::new(self.room_id, self.key.as_str(), message_tx).await?;
+
+        let mut consumer_handle = tokio::spawn(async move { conn.start().await });
+
+        self.concile_status().await?;
+
+        loop {
+            let next_concile =
+                self.live_status.live_status_updated_at + std::time::Duration::from_secs(300);
+            tokio::select! {
+                ch = &mut consumer_handle => {
+                    println!("Message connection closed");
+                    return ch?;
+                },
+
+                Some(m) = message_rx.recv() => {
+                    self.live_status.handle_msg(self.room_id, &m, &self.pool).await?;
+                },
+
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_concile)) => {
+                    self.concile_status().await?;
+                },
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let dml =
@@ -180,61 +248,24 @@ async fn main() -> Result<()> {
 
     println!("Database connected");
 
-    let room_id = std::env::var("LIVE_ROOM_ID")
-        .unwrap()
-        .parse::<u32>()
-        .context("ROOM_ID is not a valid u32")?;
+    let room_ids_string = std::env::var("LIVE_ROOM_ID").unwrap();
+    let room_ids = room_ids_string.split(',').map(|s| s.parse::<u32>());
 
-    let key = if let Ok(env_key) = std::env::var("LIVE_ROOM_KEY") {
-        env_key
-    } else {
-        println!("Fetching room key from API...");
-        msg::get_room_key(room_id).await?
-    };
+    let mut set = tokio::task::JoinSet::new();
 
-    let (message_tx, mut message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
-
-    let mut conn = msg::MsgConnection::new(room_id, key.as_str(), message_tx).await?;
-
-    let consumer_handle = tokio::spawn(async move { conn.start().await });
-
-    let room_info = get_api_live_status(room_id).await?;
-    model::insert_struct(&pool, &room_info).await?;
-    let status_int = room_info.live_status.unwrap() as i32;
-    println!("Initial live status: {}", status_int);
-    store_live_status_to_db(&pool, room_id, status_int).await?;
-    let status_int = Arc::new(AtomicI32::new(status_int));
-
-    let mut live_status = LiveStatus {
-        live_status: status_int.clone(),
-        live_status_updated_at: std::time::Instant::now(),
-    };
-
-    while let Some(m) = message_rx.recv().await {
-        live_status.handle_msg(room_id, &m, &pool).await?;
-
-        // todo: run in different coroutine
-        if live_status.live_status_updated_at.elapsed().as_secs() > 300 {
-            let room_info = get_api_live_status(room_id).await?;
-            let status = room_info.live_status.unwrap() as i32;
-            if status != live_status.live_status.load(Ordering::SeqCst) {
-                live_status.live_status.store(status, Ordering::SeqCst);
-                store_live_status_to_db(&pool, room_id, status).await?;
-                println!("Live status updated: {}", status);
-            }
-            if model::insert_struct(&pool, &room_info)
-                .await?
-                .rows_affected()
-                > 0
-            {
-                println!("Room info updated {:?}", room_info);
-            }
-            live_status.live_status_updated_at = std::time::Instant::now();
-        }
+    for room_id in room_ids {
+        let room_id = room_id.context("Invalid room ID")?;
+        let pool_ref = pool.clone();
+        let mut rw = RoomWatch::new(room_id, pool_ref).await?;
+        set.spawn(async move { rw.run().await });
     }
 
-    println!("WebSocket handshake has been successfully completed");
-
-    consumer_handle.await??;
+    loop {
+        if let Some(res) = set.join_next().await {
+            res??;
+        } else {
+            break;
+        }
+    }
     Ok(())
 }
