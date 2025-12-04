@@ -4,6 +4,7 @@ use serde::Deserialize;
 use sqlx::PgTransaction;
 use sqlx::postgres::PgQueryResult;
 use sqlx::query::Query;
+use sqlx::types::chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use sqlx::{Execute, PgPool, query};
 
 type PgQuery<'q> = Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
@@ -35,6 +36,35 @@ pub struct RoomInfo {
     pub live_status: Option<i16>,
     title: String,
     up_session: Option<String>,
+
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_sqlx_datetime")]
+    live_time: Option<DateTime<FixedOffset>>,
+}
+
+static TIMEZONE: FixedOffset = FixedOffset::east_opt(8 * 3600).unwrap();
+
+fn deserialize_sqlx_datetime<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<DateTime<FixedOffset>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = match Option::<String>::deserialize(deserializer)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    if s == "0000-00-00 00:00:00" {
+        return Ok(None);
+    }
+
+    let ndt =
+        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").map_err(serde::de::Error::custom)?;
+    let dt = TIMEZONE.from_local_datetime(&ndt).single().ok_or_else(|| {
+        serde::de::Error::custom("Failed to convert to DateTime with FixedOffset")
+    })?;
+    Ok(Some(dt))
 }
 
 impl FromMsg for RoomInfo {
@@ -56,8 +86,8 @@ impl Insertable for RoomInfo {
         query!(
             r#"
             WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('room_info'), $1) AS got)
-            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title, live_id_str)
-            SELECT NOW(), $1, $2, $3, $4, $5, $6, $7
+            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title, live_id_str, live_time)
+            SELECT NOW(), $1, $2, $3, $4, $5, $6, $7, $8
             WHERE
                 (SELECT got FROM lock)
             AND NOT COALESCE((
@@ -79,12 +109,13 @@ impl Insertable for RoomInfo {
             self.parent_area_name,
             self.title,
             self.up_session,
+            self.live_time
         )
     }
 }
 
 impl RoomInfo {
-    pub fn from_api_result(room_id: u32, rsp: &serde_json::Value) -> Result<RoomInfo> {
+    pub fn from_api_result(room_id: u32, rsp: &serde_json::Value) -> Result<Self> {
         let room_id = room_id as i32;
         let data = rsp.get("data").context("Missing data field")?;
         let result = Self::deserialize(data)?;
@@ -423,7 +454,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_api_room_info() -> Result<()> {
-        let ret = json!({
+        let mut ret = json!({
           "code": 0,
           "msg": "ok",
           "message": "ok",
@@ -461,8 +492,21 @@ mod tests {
         assert_eq!(room_info.parent_area_id, 11);
         assert_eq!(room_info.parent_area_name, "知识");
         assert_eq!(room_info.live_status, Some(1));
+        assert_eq!(
+            room_info.live_time.unwrap(),
+            TIMEZONE
+                .with_ymd_and_hms(2025, 10, 30, 18, 43, 53)
+                .single()
+                .unwrap()
+        );
         assert_eq!(room_info.title, "全球地震预警-信息/海啸信息/EEW");
-        test_insertable(&room_info).await
+        test_insertable(&room_info).await?;
+
+        ret["data"]["live_time"] = serde_json::Value::String("0000-00-00 00:00:00".to_string());
+        let room_info = RoomInfo::from_api_result(12345, &ret)?;
+        assert!(room_info.live_time.is_none());
+        test_insertable(&room_info).await?;
+        Ok(())
     }
 
     #[tokio::test]
