@@ -149,6 +149,6 @@ jobs:
           ls -lah
           # scp -C bili-live-pulse.tar.gz ${{ matrix.remote }}:/dev/shm
 
-          ssh ${{ matrix.remote }} docker images bili-live-pulse || true
+          ssh ${{ matrix.remote }} sudo podman images bili-live-pulse || true
 
-          ssh ${{ matrix.remote }} "docker load" < ./image/bili-live-pulse.tar.gz
+          ssh ${{ matrix.remote }} "sudo podman load" < ./image/bili-live-pulse.tar.gz
