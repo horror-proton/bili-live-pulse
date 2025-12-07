@@ -26,8 +26,11 @@ struct DanmuInfoResultData {
     token: String,
 }
 
-pub async fn get_room_key(roomid: u32) -> Result<String> {
-    let keys = wbi::get_wbi_keys().await?;
+pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Result<String> {
+    let keys = match wbi_keys {
+        Some(k) => k,
+        None => wbi::get_wbi_keys().await?,
+    };
 
     let params = wbi::encode_wbi(
         vec![

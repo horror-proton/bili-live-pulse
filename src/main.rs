@@ -14,6 +14,9 @@ use crate::model::FromMsg;
 
 mod wbi;
 
+mod token_bucket;
+use crate::token_bucket::TokenBucket;
+
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
@@ -173,11 +176,17 @@ struct RoomWatch {
 
     pool: sqlx::Pool<sqlx::Postgres>,
     live_status: LiveStatus,
+    token_bucket: Arc<TokenBucket>,
 }
 
 impl RoomWatch {
-    pub async fn new(room_id: u32, pool: sqlx::Pool<sqlx::Postgres>) -> Result<Self> {
-        let key = msg::get_room_key(room_id).await?;
+    pub async fn new(
+        room_id: u32,
+        pool: sqlx::Pool<sqlx::Postgres>,
+        wbi_keys: (String, String),
+        token_bucket: Arc<TokenBucket>,
+    ) -> Result<Self> {
+        let key = msg::get_room_key(room_id, Some(wbi_keys)).await?;
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
             live_status_updated_at: std::time::Instant::now(),
@@ -187,6 +196,7 @@ impl RoomWatch {
             key,
             pool,
             live_status,
+            token_bucket,
         })
     }
 
@@ -212,6 +222,9 @@ impl RoomWatch {
 
         let mut consumer_handle = tokio::spawn(async move { conn.start().await });
 
+        while !self.token_bucket.try_consume_one() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         self.concile_status().await?;
 
         loop {
@@ -228,7 +241,9 @@ impl RoomWatch {
                 },
 
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_concile)) => {
-                    self.concile_status().await?;
+                    if self.token_bucket.try_consume_one() {
+                        self.concile_status().await?;
+                    }
                 },
             }
         }
@@ -248,15 +263,27 @@ async fn main() -> Result<()> {
 
     println!("Database connected");
 
-    let room_ids_string = std::env::var("LIVE_ROOM_ID").unwrap();
-    let room_ids = room_ids_string.split(',').map(|s| s.parse::<u32>());
+    let room_ids_string = std::env::var("LIVE_ROOM_ID").unwrap_or(String::new());
+    let room_ids = room_ids_string
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>());
 
     let mut set = tokio::task::JoinSet::new();
 
+    let token_bucket = TokenBucket::new(5, 1);
+    let wbi_keys = wbi::get_wbi_keys().await?;
+
     for room_id in room_ids {
         let room_id = room_id.context("Invalid room ID")?;
+        if room_id == 0 {
+            continue;
+        }
+
         let pool_ref = pool.clone();
-        let mut rw = RoomWatch::new(room_id, pool_ref).await?;
+        let mut rw =
+            RoomWatch::new(room_id, pool_ref, wbi_keys.clone(), token_bucket.clone()).await?;
         set.spawn(async move { rw.run().await });
     }
 
