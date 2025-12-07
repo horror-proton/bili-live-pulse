@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use tokio::sync::mpsc;
+use tokio::time;
 
 mod msg;
 use msg::LiveMessage;
@@ -60,7 +61,7 @@ async fn store_live_status_to_db(
 
 struct LiveStatus {
     live_status: Arc<AtomicI32>,
-    live_status_updated_at: std::time::Instant,
+    live_status_updated_at: time::Instant,
 }
 
 impl LiveStatus {
@@ -189,7 +190,7 @@ impl RoomWatch {
         let key = msg::get_room_key(room_id, Some(wbi_keys)).await?;
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
-            live_status_updated_at: std::time::Instant::now(),
+            live_status_updated_at: time::Instant::now(),
         };
         Ok(Self {
             room_id,
@@ -212,7 +213,7 @@ impl RoomWatch {
         }
         model::insert_struct(&self.pool, &room_info).await?;
 
-        self.live_status.live_status_updated_at = std::time::Instant::now();
+        self.live_status.live_status_updated_at = time::Instant::now();
         Ok(room_info)
     }
 
@@ -223,13 +224,13 @@ impl RoomWatch {
         let mut consumer_handle = tokio::spawn(async move { conn.start().await });
 
         while !self.token_bucket.try_consume_one() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            time::sleep(time::Duration::from_millis(100)).await;
         }
         self.concile_status().await?;
 
         loop {
             let next_concile =
-                self.live_status.live_status_updated_at + std::time::Duration::from_secs(300);
+                self.live_status.live_status_updated_at + time::Duration::from_secs(300);
             tokio::select! {
                 ch = &mut consumer_handle => {
                     println!("Message connection closed");
@@ -240,9 +241,11 @@ impl RoomWatch {
                     self.live_status.handle_msg(self.room_id, &m, &self.pool).await?;
                 },
 
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_concile)) => {
+                _ = time::sleep_until(next_concile) => {
                     if self.token_bucket.try_consume_one() {
                         self.concile_status().await?;
+                    } else {
+                        self.live_status.live_status_updated_at += time::Duration::from_secs(10);
                     }
                 },
             }
