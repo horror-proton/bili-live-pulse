@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use tokio::sync::mpsc;
@@ -253,8 +253,52 @@ impl RoomWatch {
     }
 }
 
+static READY: AtomicBool = AtomicBool::new(false);
+
+use http_body_util::Full;
+
+async fn srv_fn(
+    req: hyper::Request<hyper::body::Incoming>,
+) -> hyper::Result<hyper::Response<Full<hyper::body::Bytes>>> {
+    use hyper::Method;
+    use hyper::Response;
+    use hyper::body::Bytes;
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/healthz") => Ok(Response::new(Full::new(Bytes::from("Ok\r\n")))),
+        (&Method::GET, "/readyz") => {
+            if READY.load(Ordering::SeqCst) {
+                Ok(Response::new(Full::new(Bytes::from("Ok\r\n"))))
+            } else {
+                Ok(Response::builder()
+                    .status(503)
+                    .body(Full::new(Bytes::from("Not Ready\r\n")))
+                    .unwrap())
+            }
+        }
+        _ => Ok(Response::builder()
+            .status(404)
+            .body(Full::new(Bytes::from("Not Found\r\n")))
+            .unwrap()),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, hyper::service::service_fn(srv_fn))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
     let dml =
         std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
 
@@ -289,6 +333,9 @@ async fn main() -> Result<()> {
             RoomWatch::new(room_id, pool_ref, wbi_keys.clone(), token_bucket.clone()).await?;
         set.spawn(async move { rw.run().await });
     }
+
+    // TODO: Wait for all websocket connections to be ready
+    READY.store(true, Ordering::SeqCst);
 
     loop {
         if let Some(res) = set.join_next().await {
