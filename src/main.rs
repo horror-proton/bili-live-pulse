@@ -76,12 +76,12 @@ impl LiveStatus {
                 match cmd {
                     "LIVE" => {
                         self.live_status.store(1, Ordering::SeqCst);
-                        println!("Live started");
+                        println!("Live started: {}", m);
                         store_live_status_to_db(pool, room_id, 1).await?;
                     }
                     "PREPARING" => {
                         self.live_status.store(0, Ordering::SeqCst);
-                        println!("Live ended");
+                        println!("Live ended: {}", m);
                         store_live_status_to_db(pool, room_id, 0).await?;
                     }
                     "DANMU_MSG" => {
