@@ -71,88 +71,91 @@ impl LiveStatus {
         msg: &LiveMessage,
         pool: &sqlx::Pool<sqlx::Postgres>,
     ) -> Result<()> {
-        if let LiveMessage::Message(m) = msg {
-            if let Some(cmd) = m.get("cmd").and_then(|c| c.as_str()) {
-                match cmd {
-                    "LIVE" => {
-                        self.live_status.store(1, Ordering::SeqCst);
-                        println!("Live started: {}", m);
-                        store_live_status_to_db(pool, room_id, 1).await?;
-                    }
-                    "PREPARING" => {
-                        self.live_status.store(0, Ordering::SeqCst);
-                        println!("Live ended: {}", m);
-                        store_live_status_to_db(pool, room_id, 0).await?;
-                    }
-                    "DANMU_MSG" => {
-                        // println!("{}", m.to_string());
-                        if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
-                            if info.len() >= 3 {
-                                let extra = info[0]
-                                    .get(15)
-                                    .context("Missing field 15 in info[0]")?
-                                    .get("extra")
-                                    .context("Missing extra field")?
-                                    .as_str()
-                                    .context("extra is not a string")?;
-                                let ts = info[0].get(4).and_then(|t| t.as_u64()).unwrap_or(0);
-                                let id = serde_json::from_str::<serde_json::Value>(extra)?
-                                    .get("id_str")
-                                    .context("Missing id_str in extra")?
-                                    .as_str()
-                                    .context("id_str is not a string")?
-                                    .to_string();
-                                let content = info[1].as_str().unwrap_or("");
-                                store_danmaku_to_db(pool, ts, id.as_str(), room_id, content)
-                                    .await?;
-                            }
-                        }
-                    }
-                    "GUARD_BUY" => {
-                        let record = model::Guard::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "WATCHED_CHANGE" => {
-                        if self.live_status.load(Ordering::SeqCst) != 1 {
-                            return Ok(());
-                        }
-                        let record = model::Watched::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "ONLINE_RANK_COUNT" => {
-                        if self.live_status.load(Ordering::SeqCst) != 1 {
-                            return Ok(());
-                        }
-                        let record = model::OnlineCount::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "LIKE_INFO_V3_UPDATE" => {
-                        if self.live_status.load(Ordering::SeqCst) != 1 {
-                            return Ok(());
-                        }
-                        let record = model::LikeInfo::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "ROOM_CHANGE" => {
-                        println!("Room info changed {}", m);
-                        let record = model::RoomInfo::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "ROOM_REAL_TIME_MESSAGE_UPDATE" => {
-                        let record = model::RealTimeMessage::from_msg(room_id, m)?;
-                        model::insert_struct(pool, &record).await?;
-                    }
-                    "DM_INTERACTION" => {}
-                    "LIKE_INFO_V3_UPDATE" => {}
-                    "INTERACT_WORD_V2" => {}
-                    "ONLINE_RANK_V3" => {}
-                    "STOP_LIVE_ROOM_LIST" => {}
-                    "ENTRY_EFFECT" => {}
-                    "NOTICE_MSG" => {}
-                    "LOG_IN_NOTICE" => {}
-                    _ => println!("Other command: {}", m.to_string()),
+        match msg {
+            LiveMessage::Message(m) => match m.get("cmd").and_then(|c| c.as_str()) {
+                Some("LIVE") => {
+                    self.live_status.store(1, Ordering::SeqCst);
+                    println!("Live started: {}", m);
+                    store_live_status_to_db(pool, room_id, 1).await?;
                 }
-            }
+                Some("PREPARING") => {
+                    self.live_status.store(0, Ordering::SeqCst);
+                    println!("Live ended: {}", m);
+                    store_live_status_to_db(pool, room_id, 0).await?;
+                }
+                Some("DANMU_MSG") => {
+                    // println!("{} {}", room_id, m.to_string());
+                    if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
+                        if info.len() >= 3 {
+                            let extra = info[0]
+                                .get(15)
+                                .context("Missing field 15 in info[0]")?
+                                .get("extra")
+                                .context("Missing extra field")?
+                                .as_str()
+                                .context("extra is not a string")?;
+                            let ts = info[0].get(4).and_then(|t| t.as_u64()).unwrap_or(0);
+                            let id = serde_json::from_str::<serde_json::Value>(extra)?
+                                .get("id_str")
+                                .context("Missing id_str in extra")?
+                                .as_str()
+                                .context("id_str is not a string")?
+                                .to_string();
+                            let content = info[1].as_str().unwrap_or("");
+                            store_danmaku_to_db(pool, ts, id.as_str(), room_id, content).await?;
+                        }
+                    }
+                }
+                Some("GUARD_BUY") => {
+                    let record = model::Guard::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                Some("WATCHED_CHANGE") => {
+                    if self.live_status.load(Ordering::SeqCst) != 1 {
+                        return Ok(());
+                    }
+                    let record = model::Watched::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                Some("ONLINE_RANK_COUNT") => {
+                    if self.live_status.load(Ordering::SeqCst) != 1 {
+                        return Ok(());
+                    }
+                    let record = model::OnlineCount::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                Some("LIKE_INFO_V3_UPDATE") => {
+                    if self.live_status.load(Ordering::SeqCst) != 1 {
+                        return Ok(());
+                    }
+                    let record = model::LikeInfo::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                Some("ROOM_CHANGE") => {
+                    println!("Room info changed {}", m);
+                    let record = model::RoomInfo::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                Some("ROOM_REAL_TIME_MESSAGE_UPDATE") => {
+                    let record = model::RealTimeMessage::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
+                /*
+                "DM_INTERACTION" => {}
+                "LIKE_INFO_V3_UPDATE" => {}
+                Other command: {"cmd":"ROOM_CHANGE","data":{"area_id":216,"area_name":"我的世界","live_key":"637964572313074796","parent_area_id":6,"parent_area_name":"单机游戏","sub_session_key":"637964572313074796sub_time:1760781222","title":"游戏超链接！~我的世界~"}}
+                */
+                Some("LIKE_INFO_V3_CLICK") => {}
+                Some("INTERACT_WORD_V2") => {}
+                Some("ONLINE_RANK_V3") => {}
+                Some("STOP_LIVE_ROOM_LIST") => {}
+                Some("ENTRY_EFFECT") => {}
+                Some("NOTICE_MSG") => {}
+                Some("LOG_IN_NOTICE") => {}
+                _ => println!("Other command: {}", m.to_string()),
+            },
+
+            _ => {}
         };
         Ok(())
     }
