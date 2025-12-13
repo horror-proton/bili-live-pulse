@@ -62,6 +62,7 @@ async fn store_live_status_to_db(
 struct LiveStatus {
     live_status: Arc<AtomicI32>,
     live_status_updated_at: time::Instant,
+    live_id_str: Option<String>,
 }
 
 impl LiveStatus {
@@ -79,16 +80,27 @@ impl LiveStatus {
                     store_live_status_to_db(pool, room_id, 1).await?;
 
                     let record = model::LiveMeta::from_msg(room_id, m)?;
+                    self.live_id_str = if record.live_key.is_empty() {
+                        None
+                    } else {
+                        Some(record.live_key.clone())
+                    };
+
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("PREPARING") => {
                     self.live_status.store(0, Ordering::SeqCst);
                     println!("Live ended: {}", m);
                     store_live_status_to_db(pool, room_id, 0).await?;
-                    // TODO: parse time from message
-                    model::store_live_meta_end_time(room_id as i32)
-                        .execute(pool)
-                        .await?;
+
+                    let record = model::LiveMetaEnd::from_msg(room_id, m)?;
+                    if let Some(live_id_str) = &self.live_id_str {
+                        record.store_end_time_est(live_id_str).execute(pool).await?;
+                    } else {
+                        model::store_live_meta_end_time(room_id as i32)
+                            .execute(pool)
+                            .await?;
+                    }
                 }
                 Some("DANMU_MSG") => {
                     // println!("{} {}", room_id, m.to_string());
@@ -201,6 +213,7 @@ impl RoomWatch {
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
             live_status_updated_at: time::Instant::now(),
+            live_id_str: None,
         };
         Ok(Self {
             room_id,
@@ -217,6 +230,7 @@ impl RoomWatch {
         println!("Fetched room info from API {:?}", room_info);
 
         let status = room_info.live_status.unwrap() as i32;
+        self.live_status.live_id_str = room_info.up_session.clone();
         if status as i32 != self.live_status.live_status.load(Ordering::SeqCst) {
             self.live_status.live_status.store(status, Ordering::SeqCst);
             store_live_status_to_db(&self.pool, self.room_id, status).await?;

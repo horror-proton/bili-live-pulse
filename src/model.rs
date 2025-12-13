@@ -35,7 +35,7 @@ pub struct RoomInfo {
     parent_area_name: String,
     pub live_status: Option<i16>,
     title: String,
-    up_session: Option<String>,
+    pub up_session: Option<String>,
 
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_sqlx_datetime")]
@@ -160,7 +160,7 @@ pub fn store_live_meta_end_time(room_id: i32) -> PgQuery<'static> {
 #[derive(Deserialize, Debug)]
 pub struct LiveMeta {
     roomid: i32,
-    live_key: String,
+    pub live_key: String,
     live_platform: Option<String>,
     live_time: Option<i64>,
 }
@@ -197,6 +197,40 @@ impl Insertable for LiveMeta {
             self.roomid,
             self.live_time.map(|t| t as f64),
             self.live_platform,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LiveMetaEnd {
+    #[serde(skip)]
+    room_id: i32,
+    send_time: i64,
+}
+
+impl FromMsg for LiveMetaEnd {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let data = m;
+        let result = Self::deserialize(data)?;
+        Ok(Self { room_id, ..result })
+    }
+}
+
+impl LiveMetaEnd {
+    pub fn store_end_time_est(&self, live_id_str: &str) -> PgQuery<'_> {
+        query!(
+            r#"
+            UPDATE live_meta
+            SET end_time_est = TO_TIMESTAMP($2)
+            WHERE live_id_str = $1
+            AND end_time_est IS NULL
+            "#,
+            live_id_str,
+            self.send_time as f64 / 1000.0,
         )
     }
 }
@@ -683,6 +717,33 @@ mod tests {
             .await?
             .end_time_before
             .context("end_time_before should be set")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_live_end() -> Result<()> {
+        let pool = test_pool().await;
+        let mut tx = get_tx(&pool).await;
+
+        let ret = json!({"cmd":"PREPARING","msg_id":"75389731379118592:1000:1000","p_is_ack":true,"p_msg_type":1,"roomid":"81004","send_time":1760451130537_i64});
+        let data = LiveMetaEnd::from_msg(12345, &ret)?;
+        assert_eq!(data.send_time, 1760451130537_i64);
+
+        query!("INSERT INTO live_meta (live_id_str, room_id, live_time) VALUES ('test_live_end', 12345, TO_TIMESTAMP(1760450000)) ON CONFLICT DO NOTHING")
+            .execute(&mut *tx)
+            .await?;
+
+        data.store_end_time_est("test_live_end")
+            .execute(&mut *tx)
+            .await?;
+
+        query!("SELECT end_time_est FROM live_meta WHERE live_id_str = 'test_live_end' LIMIT 1")
+            .fetch_one(&mut *tx)
+            .await?
+            .end_time_est
+            .context("end_time_est should be set")?;
 
         Ok(())
     }
