@@ -77,11 +77,18 @@ impl LiveStatus {
                     self.live_status.store(1, Ordering::SeqCst);
                     println!("Live started: {}", m);
                     store_live_status_to_db(pool, room_id, 1).await?;
+
+                    let record = model::LiveMeta::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
                 }
                 Some("PREPARING") => {
                     self.live_status.store(0, Ordering::SeqCst);
                     println!("Live ended: {}", m);
                     store_live_status_to_db(pool, room_id, 0).await?;
+                    // TODO: parse time from message
+                    model::store_live_meta_end_time(room_id as i32)
+                        .execute(pool)
+                        .await?;
                 }
                 Some("DANMU_MSG") => {
                     // println!("{} {}", room_id, m.to_string());
@@ -215,8 +222,9 @@ impl RoomWatch {
             store_live_status_to_db(&self.pool, self.room_id, status).await?;
         }
         model::insert_struct(&self.pool, &room_info).await?;
-
         self.live_status.live_status_updated_at = time::Instant::now();
+
+        room_info.update_live_meta(&self.pool).await?;
         Ok(room_info)
     }
 

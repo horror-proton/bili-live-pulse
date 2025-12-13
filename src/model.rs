@@ -121,6 +121,84 @@ impl RoomInfo {
         let result = Self::deserialize(data)?;
         Ok(Self { room_id, ..result })
     }
+
+    fn generate_live_meta(&self) -> Option<LiveMeta> {
+        let live_key = self.up_session.as_ref()?;
+        if live_key.is_empty() {
+            return None;
+        }
+        return Some(LiveMeta {
+            roomid: self.room_id,
+            live_key: live_key.clone(),
+            live_platform: None,
+            live_time: self.live_time.map(|dt| dt.timestamp() as i64),
+        });
+    }
+
+    pub async fn update_live_meta(&self, pool: &PgPool) -> sqlx::Result<()> {
+        if let Some(live_meta) = self.generate_live_meta() {
+            insert_struct(pool, &live_meta).await?;
+        } else if self.live_status != None && self.live_status != Some(1) {
+            store_live_meta_end_time(self.room_id).execute(pool).await?;
+        }
+        Ok(())
+    }
+}
+
+pub fn store_live_meta_end_time(room_id: i32) -> PgQuery<'static> {
+    query!(
+        r#"
+        UPDATE live_meta
+        SET end_time_before = NOW()
+        WHERE room_id = $1
+        AND end_time_before IS NULL AND end_time_est IS NULL
+        "#,
+        room_id
+    )
+}
+
+#[derive(Deserialize, Debug)]
+pub struct LiveMeta {
+    roomid: i32,
+    live_key: String,
+    live_platform: Option<String>,
+    live_time: Option<i64>,
+}
+
+impl FromMsg for LiveMeta {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let data = m;
+        let result = Self::deserialize(data)?;
+        Ok(Self {
+            roomid: room_id,
+            ..result
+        })
+    }
+}
+
+impl Insertable for LiveMeta {
+    fn build_query(&self) -> PgQuery<'_> {
+        query!(
+            r#"
+            INSERT INTO live_meta (live_id_str, room_id, live_time, live_platform)
+            VALUES ($1, $2, TO_TIMESTAMP($3), $4)
+            ON CONFLICT (live_id_str)
+            DO UPDATE SET
+                live_time = EXCLUDED.live_time,
+                live_platform = EXCLUDED.live_platform
+            WHERE (live_meta.live_time IS NULL AND EXCLUDED.live_time IS NOT NULL)
+            OR (live_meta.live_platform IS NULL AND EXCLUDED.live_platform IS NOT NULL)
+            "#,
+            self.live_key,
+            self.roomid,
+            self.live_time.map(|t| t as f64),
+            self.live_platform,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -506,6 +584,106 @@ mod tests {
         let room_info = RoomInfo::from_api_result(12345, &ret)?;
         assert!(room_info.live_time.is_none());
         test_insertable(&room_info).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_live_start_1() -> Result<()> {
+        let ret = json!(
+        {
+            "cmd":"LIVE",
+            "live_key":"650619521652046956",
+            "live_model":0,
+            "live_platform":"pc",
+            "live_time":1765368103,
+            "roomid":12345,
+            "special_types":[50],
+            "sub_session_key":"650619521652046956sub_time:1765368103",
+            "voice_background":""
+        });
+        let data = LiveMeta::from_msg(12345, &ret)?;
+        assert_eq!(data.live_key, "650619521652046956");
+        assert_eq!(data.live_platform, Some(String::from("pc")));
+        assert_eq!(data.live_time, Some(1765368103));
+
+        let pool = test_pool().await;
+        let mut tx = get_tx(&pool).await;
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(res.rows_affected(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_live_start_2() -> Result<()> {
+        let ret = json!(
+        {
+            "cmd":"LIVE",
+            "live_key":"650619521652046956",
+            "live_model":0,
+            "live_platform":"pc",
+            "roomid":81004,
+            "sub_session_key":"650619521652046956sub_time:1765368103",
+            "voice_background":""
+        });
+        let data = LiveMeta::from_msg(12345, &ret)?;
+        assert_eq!(data.live_key, "650619521652046956");
+        assert_eq!(data.live_platform, Some(String::from("pc")));
+        assert_eq!(data.live_time, None);
+
+        let pool = test_pool().await;
+        let mut tx = get_tx(&pool).await;
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(res.rows_affected(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_live_meta_from_room_info() -> Result<()> {
+        let pool = test_pool().await;
+        let mut tx = get_tx(&pool).await;
+
+        let mut ri = RoomInfo {
+            room_id: 12345,
+            area_id: 0,
+            area_name: String::new(),
+            parent_area_id: 0,
+            parent_area_name: String::new(),
+            live_status: Some(1),
+            title: String::new(),
+            up_session: Some(String::from("11111111")),
+            live_time: Some(
+                TIMEZONE
+                    .with_ymd_and_hms(2025, 10, 30, 18, 43, 53)
+                    .single()
+                    .unwrap(),
+            ),
+        };
+
+        // store new live meta
+        ri.generate_live_meta()
+            .unwrap()
+            .build_query()
+            .execute(&mut *tx)
+            .await?;
+        query!(
+            "SELECT * FROM live_meta WHERE room_id = 12345 AND live_id_str = '11111111' LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        ri.live_status = Some(0);
+        store_live_meta_end_time(ri.room_id)
+            .execute(&mut *tx)
+            .await?;
+        query!("SELECT end_time_before FROM live_meta WHERE live_id_str = '11111111' LIMIT 1")
+            .fetch_one(&mut *tx)
+            .await?
+            .end_time_before
+            .context("end_time_before should be set")?;
+
         Ok(())
     }
 

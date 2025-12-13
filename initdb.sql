@@ -118,6 +118,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_guard_time_uid ON guard(time, "uid");
 
 --
 
+CREATE TABLE IF NOT EXISTS live_meta (
+    "live_id_str"   TEXT        UNIQUE NOT NULL,
+    "room_id"       INTEGER     NOT NULL,
+    "live_time"     TIMESTAMPTZ NULL,
+    "live_platform" TEXT        NULL,
+    "end_time_est" TIMESTAMPTZ NULL,
+    "end_time_before" TIMESTAMPTZ NULL
+);
+
+COMMENT ON COLUMN live_meta.end_time_before IS 'The first time we observed the stream ended.';
+
+CREATE INDEX IF NOT EXISTS idx_live_meta_room_id ON live_meta(room_id);
+
+--
+
 CREATE TABLE IF NOT EXISTS real_time_message (
     "time"      TIMESTAMPTZ NOT NULL,
     room_id     INTEGER     NOT NULL,
