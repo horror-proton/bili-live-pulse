@@ -182,15 +182,23 @@ impl LiveStatus {
 
 async fn get_api_live_status(room_id: u32) -> Result<model::RoomInfo> {
     let cli = reqwest::Client::new();
-    let resp: serde_json::Value = cli
+    let resp = cli
         .get("https://api.live.bilibili.com/room/v1/Room/get_info")
         .query(&[("room_id", room_id)])
         .send()
         .await?
-        .json()
+        .bytes() // .json()
         .await?;
 
-    model::RoomInfo::from_api_result(room_id, &resp)
+    let resp = serde_json::from_slice::<serde_json::Value>(&resp).context(format!(
+        "Missing data field in API response: {}",
+        String::from_utf8_lossy(&resp)
+    ))?;
+
+    model::RoomInfo::from_api_result(room_id, &resp).context(format!(
+        "Failed to parse info of room {}: {} ",
+        room_id, resp
+    ))
 }
 
 struct RoomWatch {

@@ -46,12 +46,17 @@ pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Re
         params
     );
 
-    let res = reqwest::Client::new()
+    use reqwest::header::USER_AGENT;
+
+    let resp = reqwest::Client::new()
         .get(&url)
+        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
         .send()
-        .await?
-        .json::<DanmuInfoResult>()
-        .await?;
+        .await?.bytes().await?;
+    let res = serde_json::from_slice::<DanmuInfoResult>(&resp).context(format!(
+        "Failed to parse getDanmuInfo response: {}",
+        String::from_utf8_lossy(&resp)
+    ))?;
 
     Ok(res.data.token)
 }

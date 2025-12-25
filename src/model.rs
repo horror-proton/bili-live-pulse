@@ -117,8 +117,11 @@ impl Insertable for RoomInfo {
 impl RoomInfo {
     pub fn from_api_result(room_id: u32, rsp: &serde_json::Value) -> Result<Self> {
         let room_id = room_id as i32;
-        let data = rsp.get("data").context("Missing data field")?;
-        let result = Self::deserialize(data)?;
+        let data = rsp
+            .get("data")
+            .context(format!("Missing data field in {}", rsp.to_string()))?;
+        let result = Self::deserialize(data)
+            .context(format!("Failed to deserialize from {}", rsp.to_string()))?;
         Ok(Self { room_id, ..result })
     }
 
@@ -136,24 +139,30 @@ impl RoomInfo {
     }
 
     pub async fn update_live_meta(&self, pool: &PgPool) -> sqlx::Result<()> {
-        if let Some(live_meta) = self.generate_live_meta() {
+        let lm = self.generate_live_meta();
+
+        // set end_time_before for previous live sessions if any
+        store_live_meta_end_time(self.room_id, lm.as_ref().map(|v| v.live_key.clone()))
+            .execute(pool)
+            .await?;
+
+        if let Some(live_meta) = lm {
             insert_struct(pool, &live_meta).await?;
-        } else if self.live_status != None && self.live_status != Some(1) {
-            store_live_meta_end_time(self.room_id).execute(pool).await?;
         }
         Ok(())
     }
 }
 
-pub fn store_live_meta_end_time(room_id: i32) -> PgQuery<'static> {
+pub fn store_live_meta_end_time(room_id: i32, key_not_eq: Option<String>) -> PgQuery<'static> {
     query!(
         r#"
         UPDATE live_meta
         SET end_time_before = NOW()
-        WHERE room_id = $1
+        WHERE room_id = $1 AND (live_id_str <> $2 OR $2 IS NULL)
         AND end_time_before IS NULL AND end_time_est IS NULL
         "#,
-        room_id
+        room_id,
+        key_not_eq,
     )
 }
 
@@ -709,7 +718,7 @@ mod tests {
         .await?;
 
         ri.live_status = Some(0);
-        store_live_meta_end_time(ri.room_id)
+        store_live_meta_end_time(ri.room_id, None)
             .execute(&mut *tx)
             .await?;
         query!("SELECT end_time_before FROM live_meta WHERE live_id_str = '11111111' LIMIT 1")
