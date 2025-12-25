@@ -209,6 +209,7 @@ impl RoomWatch {
         wbi_keys: (String, String),
         token_bucket: Arc<TokenBucket>,
     ) -> Result<Self> {
+        token_bucket.consume_one().await;
         let key = msg::get_room_key(room_id, Some(wbi_keys)).await?;
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
@@ -248,9 +249,7 @@ impl RoomWatch {
 
         let mut consumer_handle = tokio::spawn(async move { conn.start().await });
 
-        while !self.token_bucket.try_consume_one() {
-            time::sleep(time::Duration::from_millis(100)).await;
-        }
+        self.token_bucket.consume_one().await;
         self.concile_status().await?;
 
         loop {
