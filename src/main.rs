@@ -208,6 +208,9 @@ struct RoomWatch {
     pool: sqlx::Pool<sqlx::Postgres>,
     live_status: LiveStatus,
     token_bucket: Arc<TokenBucket>,
+
+    message_rx: mpsc::Receiver<msg::LiveMessage>,
+    consumer_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl RoomWatch {
@@ -224,12 +227,17 @@ impl RoomWatch {
             live_status_updated_at: time::Instant::now(),
             live_id_str: None,
         };
+        let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
+        let mut conn = msg::MsgConnection::new(room_id, key.as_str(), message_tx).await?;
+        let consumer_handle = tokio::spawn(async move { conn.start().await });
         Ok(Self {
             room_id,
             key,
             pool,
             live_status,
             token_bucket,
+            message_rx,
+            consumer_handle,
         })
     }
 
@@ -252,10 +260,7 @@ impl RoomWatch {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let (message_tx, mut message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
-        let mut conn = msg::MsgConnection::new(self.room_id, self.key.as_str(), message_tx).await?;
-
-        let mut consumer_handle = tokio::spawn(async move { conn.start().await });
+        // TODO: concile only when a watched message is received recently
 
         self.token_bucket.consume_one().await;
         self.concile_status().await?;
@@ -264,18 +269,22 @@ impl RoomWatch {
             let next_concile =
                 self.live_status.live_status_updated_at + time::Duration::from_secs(300);
             tokio::select! {
-                ch = &mut consumer_handle => {
+                ch = &mut self.consumer_handle => {
                     println!("Message connection closed");
                     return ch?;
                 },
 
-                Some(m) = message_rx.recv() => {
+                Some(m) = self.message_rx.recv() => {
                     self.live_status.handle_msg(self.room_id, &m, &self.pool).await?;
                 },
 
                 _ = time::sleep_until(next_concile) => {
-                    if self.token_bucket.try_consume_one() {
-                        self.concile_status().await?;
+                    if self.token_bucket.try_consume_one()  &&
+                        self.concile_status().await.map_err(|e| {
+                            println!("Failed to concile status for room {}: {}", self.room_id, e);
+                            e
+                        }).is_ok()
+                    {
                     } else {
                         self.live_status.live_status_updated_at += time::Duration::from_secs(10);
                     }

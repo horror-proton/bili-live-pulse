@@ -191,6 +191,11 @@ impl FromMsg for LiveMeta {
 
 impl Insertable for LiveMeta {
     fn build_query(&self) -> PgQuery<'_> {
+        if self.live_key.is_empty() || self.live_key == "0" {
+            // TODO: add test for Live started: {"cmd":"LIVE","live_key":"0","live_model":0,"live_platform":"pc_link","roomid":24872476,"sub_session_key":"","voice_background":""}
+            println!("Empty live_key, skip inserting live_meta {:?}", self);
+            return query!("");
+        }
         query!(
             r#"
             INSERT INTO live_meta (live_id_str, room_id, live_time, live_platform)
