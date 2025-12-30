@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::protocol;
 
 use crate::wbi;
@@ -48,6 +49,7 @@ pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Re
 
     use reqwest::header::USER_AGENT;
 
+    println!("Fetching room key from URL: {}", url);
     let resp = reqwest::Client::new()
         .get(&url)
         .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
@@ -261,15 +263,26 @@ pub struct MsgConnection {
     >,
     sequence: AtomicU32,
     heartbeat_pending: Arc<AtomicBool>,
-    message_tx: mpsc::Sender<LiveMessage>,
+}
+
+pub enum MsgError {
+    AuthError,
+    AnyhowError(anyhow::Error),
+}
+
+// TODO: use thiserror
+impl From<anyhow::Error> for MsgError {
+    fn from(err: anyhow::Error) -> Self {
+        MsgError::AnyhowError(err)
+    }
 }
 
 impl MsgConnection {
     pub async fn new(
         roomid: u32,
         key: &str,
-        message_tx: mpsc::Sender<LiveMessage>,
-    ) -> Result<Self> {
+        // message_tx: mpsc::Sender<LiveMessage>,
+    ) -> std::result::Result<Self, MsgError> {
         use reqwest::header::{
             CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE, USER_AGENT,
         };
@@ -298,9 +311,16 @@ impl MsgConnection {
         write
             .send(protocol::Message::binary(auth_msg))
             .await
-            .context("Failed to send auth message")?;
+            .map_err(|_| MsgError::AuthError)?;
 
-        let rsp = read_stream.next().await.expect("Failed to read message")?;
+        let rsp = read_stream
+            .next()
+            .await
+            .expect("Failed to read message")
+            .map_err(|e| match e {
+                tungstenite::Error::Protocol(_) => MsgError::AuthError,
+                _ => MsgError::AnyhowError(anyhow::anyhow!(e)),
+            })?;
 
         if let protocol::Message::Binary(bin) = rsp {
             let decompressed = decompress_packet(&bin).context("Failed to decompress packet")?;
@@ -308,7 +328,10 @@ impl MsgConnection {
                 let rsp = LiveMessage::from_payload(&decompressed_data, operation);
                 if let LiveMessage::AuthReply(_) = rsp {
                 } else {
-                    return Err(anyhow::anyhow!("Expected AuthReply, but got {:?}", rsp));
+                    return Err(MsgError::AnyhowError(anyhow::anyhow!(
+                        "Expected AuthReply, but got {:?}",
+                        rsp
+                    )));
                 }
             }
         }
@@ -320,11 +343,15 @@ impl MsgConnection {
             write_stream: write,
             sequence: AtomicU32::new(1),
             heartbeat_pending,
-            message_tx,
+            // message_tx,
         })
     }
 
-    async fn forward_one(&mut self, pmsg: protocol::Message) -> Result<()> {
+    async fn forward_one(
+        &mut self,
+        pmsg: protocol::Message,
+        message_tx: &mpsc::Sender<LiveMessage>,
+    ) -> Result<()> {
         let bin = match pmsg {
             protocol::Message::Binary(b) => b,
             _ => return Ok(()),
@@ -338,13 +365,13 @@ impl MsgConnection {
                 self.handle_heartbeat_reply();
             }
 
-            self.message_tx.send(live_msg).await?;
+            message_tx.send(live_msg).await?;
         }
 
         Ok(())
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&mut self, message_tx: mpsc::Sender<LiveMessage>) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         loop {
             tokio::select! {
@@ -358,7 +385,7 @@ impl MsgConnection {
                         None => break,
                     };
 
-                    self.forward_one(pmsg).await?;
+                    self.forward_one(pmsg, &message_tx).await?;
                 },
 
                 _ = interval.tick() => {

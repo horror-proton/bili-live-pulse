@@ -4,6 +4,20 @@
 \timing
 -- DROP TABLE IF EXISTS danmaku;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+
+-- room_key_cache
+CREATE TABLE IF NOT EXISTS room_key_cache (
+    room_id     INTEGER     UNIQUE NOT NULL,
+    room_key    TEXT        NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_key_cache_room_id ON room_key_cache(room_id);
+CREATE INDEX IF NOT EXISTS idx_room_key_cache_updated_at ON room_key_cache(updated_at);
+
+--
+
 CREATE TABLE IF NOT EXISTS danmaku (
     "time"      TIMESTAMPTZ  NOT NULL,
     id_str      TEXT         NOT NULL,
