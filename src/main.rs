@@ -18,6 +18,8 @@ mod wbi;
 mod token_bucket;
 use crate::token_bucket::TokenBucket;
 
+mod pgcache;
+
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
@@ -97,7 +99,7 @@ impl LiveStatus {
                     if let Some(live_id_str) = &self.live_id_str {
                         record.store_end_time_est(live_id_str).execute(pool).await?;
                     } else {
-                        model::store_live_meta_end_time(room_id as i32)
+                        model::store_live_meta_end_time(room_id as i32, None)
                             .execute(pool)
                             .await?;
                     }
@@ -220,16 +222,44 @@ impl RoomWatch {
         wbi_keys: (String, String),
         token_bucket: Arc<TokenBucket>,
     ) -> Result<Self> {
-        token_bucket.consume_one().await;
-        let key = msg::get_room_key(room_id, Some(wbi_keys)).await?;
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
             live_status_updated_at: time::Instant::now(),
             live_id_str: None,
         };
-        let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(1000);
-        let mut conn = msg::MsgConnection::new(room_id, key.as_str(), message_tx).await?;
-        let consumer_handle = tokio::spawn(async move { conn.start().await });
+
+        let room_key_cache = pgcache::RoomKeyCache::new(pool.clone());
+
+        // TODO: Renew wbi keys if failed
+        let mut key = match room_key_cache.get(room_id as i32).await? {
+            Some(k) => k,
+            None => {
+                token_bucket.consume_one().await;
+                msg::get_room_key(room_id, Some(wbi_keys.clone())).await?
+            }
+        };
+
+        let mut conn = loop {
+            let conn = match msg::MsgConnection::new(room_id, &key).await {
+                Ok(c) => c,
+                Err(msg::MsgError::AuthError) => {
+                    println!("Auth error for room {}, fetching new key", room_id);
+                    room_key_cache.invalidate(room_id as i32, &key).await?;
+                    token_bucket.consume_one().await;
+                    key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                    continue;
+                }
+                Err(msg::MsgError::AnyhowError(a)) => {
+                    return Err(a);
+                }
+            };
+            break conn;
+        };
+
+        room_key_cache.try_store(room_id as i32, &key).await?;
+
+        let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(10);
+        let consumer_handle = tokio::spawn(async move { conn.start(message_tx).await });
         Ok(Self {
             room_id,
             key,
@@ -326,19 +356,20 @@ async fn srv_fn(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, hyper::service::service_fn(srv_fn))
-                    .await
-                    .unwrap();
+    if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, hyper::service::service_fn(srv_fn))
+                        .await
+                        .unwrap();
+                }
             }
-        }
-    });
+        });
+    }
 
     let dml =
         std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
@@ -360,7 +391,7 @@ async fn main() -> Result<()> {
 
     let mut set = tokio::task::JoinSet::new();
 
-    let token_bucket = TokenBucket::new(5, 1);
+    let token_bucket = TokenBucket::new(10, 5);
     let wbi_keys = wbi::get_wbi_keys().await?;
 
     for room_id in room_ids {
