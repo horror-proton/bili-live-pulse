@@ -20,6 +20,8 @@ use crate::token_bucket::TokenBucket;
 
 mod pgcache;
 
+use log::{debug, error, info, trace, warn};
+
 async fn store_danmaku_to_db(
     pool: &sqlx::Pool<sqlx::Postgres>,
     ts: u64,
@@ -74,11 +76,12 @@ impl LiveStatus {
         msg: &LiveMessage,
         pool: &sqlx::Pool<sqlx::Postgres>,
     ) -> Result<()> {
+        trace!(room_id; "Received message: {:?}", msg);
         match msg {
             LiveMessage::Message(m) => match m.get("cmd").and_then(|c| c.as_str()) {
                 Some("LIVE") => {
                     self.live_status.store(1, Ordering::SeqCst);
-                    println!("Live started: {}", m);
+                    info!(room_id; "Live started: {}", m);
                     store_live_status_to_db(pool, room_id, 1).await?;
 
                     let record = model::LiveMeta::from_msg(room_id, m)?;
@@ -92,7 +95,7 @@ impl LiveStatus {
                 }
                 Some("PREPARING") => {
                     self.live_status.store(0, Ordering::SeqCst);
-                    println!("Live ended: {}", m);
+                    info!(room_id; "Live ended: {}", m);
                     store_live_status_to_db(pool, room_id, 0).await?;
 
                     let record = model::LiveMetaEnd::from_msg(room_id, m)?;
@@ -153,7 +156,7 @@ impl LiveStatus {
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("ROOM_CHANGE") => {
-                    println!("Room info changed {}", m);
+                    info!(room_id; "Room info changed {}", m);
                     let record = model::RoomInfo::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
@@ -173,7 +176,7 @@ impl LiveStatus {
                 Some("ENTRY_EFFECT") => {}
                 Some("NOTICE_MSG") => {}
                 Some("LOG_IN_NOTICE") => {}
-                _ => println!("Other command: {}", m.to_string()),
+                _ => debug!(room_id; "Other command: {}", m.to_string()),
             },
 
             _ => {}
@@ -243,7 +246,7 @@ impl RoomWatch {
             let conn = match msg::MsgConnection::new(room_id, &key).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
-                    println!("Auth error for room {}, fetching new key", room_id);
+                    warn!(room_id; "Auth error renewing key {}", key);
                     room_key_cache.invalidate(room_id as i32, &key).await?;
                     token_bucket.consume_one().await;
                     key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
@@ -257,6 +260,8 @@ impl RoomWatch {
         };
 
         room_key_cache.try_store(room_id as i32, &key).await?;
+
+        info!(room_id; "WebSocket connection established");
 
         let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(10);
         let consumer_handle = tokio::spawn(async move { conn.start(message_tx).await });
@@ -274,11 +279,10 @@ impl RoomWatch {
     async fn concile_status(&mut self) -> Result<model::RoomInfo> {
         let room_info = get_api_live_status(self.room_id).await?;
 
-        println!("Fetched room info from API {:?}", room_info);
-
         let status = room_info.live_status.unwrap() as i32;
         self.live_status.live_id_str = room_info.up_session.clone();
         if status as i32 != self.live_status.live_status.load(Ordering::SeqCst) {
+            info!(room_id=self.room_id; "New live_status: {} ({})", status, room_info.title);
             self.live_status.live_status.store(status, Ordering::SeqCst);
             store_live_status_to_db(&self.pool, self.room_id, status).await?;
         }
@@ -290,17 +294,18 @@ impl RoomWatch {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // TODO: concile only when a watched message is received recently
+        // TODO: concile only when a watched/online_rank_count message is received recently
 
         self.token_bucket.consume_one().await;
         self.concile_status().await?;
 
+        let room_id = self.room_id;
         loop {
             let next_concile =
                 self.live_status.live_status_updated_at + time::Duration::from_secs(300);
             tokio::select! {
                 ch = &mut self.consumer_handle => {
-                    println!("Message connection closed");
+                    warn!(room_id; "Message connection closed");
                     return ch?;
                 },
 
@@ -309,13 +314,17 @@ impl RoomWatch {
                 },
 
                 _ = time::sleep_until(next_concile) => {
-                    if self.token_bucket.try_consume_one()  &&
-                        self.concile_status().await.map_err(|e| {
-                            println!("Failed to concile status for room {}: {}", self.room_id, e);
-                            e
-                        }).is_ok()
-                    {
-                    } else {
+                    if self.token_bucket.try_consume_one() {
+                        match self.concile_status().await {
+                            Ok(info) => debug!("{:?}" , info),
+                            Err(e) => {
+                                self.live_status.live_status_updated_at += time::Duration::from_secs(10);
+                                error!(room_id; "Failed to concile live status: {:?}", e);
+                            }
+                        };
+                    }
+                    else {
+                        warn!(room_id; "Rate limited, postpone concile");
                         self.live_status.live_status_updated_at += time::Duration::from_secs(10);
                     }
                 },
@@ -355,6 +364,8 @@ async fn srv_fn(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
     if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
         tokio::spawn(async move {
@@ -380,7 +391,7 @@ async fn main() -> Result<()> {
         .await
         .expect("Failed to create pool");
 
-    println!("Database connected");
+    info!("Databse {} connected", dml);
 
     let room_ids_string = std::env::var("LIVE_ROOM_ID").unwrap_or(String::new());
     let room_ids = room_ids_string
@@ -393,6 +404,7 @@ async fn main() -> Result<()> {
 
     let token_bucket = TokenBucket::new(10, 5);
     let wbi_keys = wbi::get_wbi_keys().await?;
+    info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
     for room_id in room_ids {
         let room_id = room_id.context("Invalid room ID")?;

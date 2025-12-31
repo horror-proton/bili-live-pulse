@@ -3,6 +3,7 @@ use brotlic::DecompressorReader;
 use flate2::bufread::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
 use hyper::Request;
+use log::{debug, error, info, trace, warn};
 use serde_json::json;
 use std::io::Read;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Re
 
     use reqwest::header::USER_AGENT;
 
-    println!("Fetching room key from URL: {}", url);
+    debug!("Fetching room key from URL: {}", url);
     let resp = reqwest::Client::new()
         .get(&url)
         .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")

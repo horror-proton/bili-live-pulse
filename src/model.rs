@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
 use sqlx::PgTransaction;
 use sqlx::postgres::PgQueryResult;
@@ -27,19 +28,19 @@ pub trait Insertable {
 #[derive(Deserialize, Debug)]
 pub struct RoomInfo {
     #[serde(skip)]
-    room_id: i32,
+    pub room_id: i32,
 
-    area_id: i32,
-    area_name: String,
-    parent_area_id: i32,
-    parent_area_name: String,
+    pub area_id: i32,
+    pub area_name: String,
+    pub parent_area_id: i32,
+    pub parent_area_name: String,
     pub live_status: Option<i16>,
-    title: String,
+    pub title: String,
     pub up_session: Option<String>,
 
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_sqlx_datetime")]
-    live_time: Option<DateTime<FixedOffset>>,
+    pub live_time: Option<DateTime<FixedOffset>>,
 }
 
 static TIMEZONE: FixedOffset = FixedOffset::east_opt(8 * 3600).unwrap();
@@ -193,7 +194,7 @@ impl Insertable for LiveMeta {
     fn build_query(&self) -> PgQuery<'_> {
         if self.live_key.is_empty() || self.live_key == "0" {
             // TODO: add test for Live started: {"cmd":"LIVE","live_key":"0","live_model":0,"live_platform":"pc_link","roomid":24872476,"sub_session_key":"","voice_background":""}
-            println!("Empty live_key, skip inserting live_meta {:?}", self);
+            warn!(room_id=self.roomid; "Empty live_key, skip inserting live_meta {:?}", self);
             return query!("");
         }
         query!(

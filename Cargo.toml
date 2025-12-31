@@ -19,6 +19,8 @@ reqwest = { version = "0.12.23", features = ["json"] }
 serde = "1"
 openssl = "0"
 hex = "0"
+log = "0"
+env_logger = { version = "0", features = ["kv"] }
 
 [dev-dependencies]
 regex = "1"
