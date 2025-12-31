@@ -223,6 +223,7 @@ impl RoomWatch {
         room_id: u32,
         pool: sqlx::Pool<sqlx::Postgres>,
         wbi_keys: (String, String),
+        room_key_cache: &pgcache::RoomKeyCache,
         token_bucket: Arc<TokenBucket>,
     ) -> Result<Self> {
         let live_status = LiveStatus {
@@ -231,25 +232,29 @@ impl RoomWatch {
             live_id_str: None,
         };
 
-        let room_key_cache = pgcache::RoomKeyCache::new(pool.clone());
-
         // TODO: Renew wbi keys if failed
-        let mut key = match room_key_cache.get(room_id as i32).await? {
+        let mut key = match room_key_cache.try_get(room_id as i32).await? {
             Some(k) => k,
             None => {
                 token_bucket.consume_one().await;
-                msg::get_room_key(room_id, Some(wbi_keys.clone())).await?
+                let new_key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                room_key_cache
+                    .insert_and_get(room_id as i32, &new_key)
+                    .await?
             }
         };
 
         let mut conn = loop {
-            let conn = match msg::MsgConnection::new(room_id, &key).await {
+            let conn = match msg::MsgConnection::new(room_id, key.key()).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
-                    warn!(room_id; "Auth error renewing key {}", key);
-                    room_key_cache.invalidate(room_id as i32, &key).await?;
+                    warn!(room_id; "Auth error renewing key {:?}", key);
+                    key.invalidate().await?;
                     token_bucket.consume_one().await;
-                    key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                    let new_key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                    key = room_key_cache
+                        .insert_and_get(room_id as i32, &new_key)
+                        .await?;
                     continue;
                 }
                 Err(msg::MsgError::AnyhowError(a)) => {
@@ -259,15 +264,16 @@ impl RoomWatch {
             break conn;
         };
 
-        room_key_cache.try_store(room_id as i32, &key).await?;
+        // TODO: store new key here, after the connection is established
 
         info!(room_id; "WebSocket connection established");
 
         let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(10);
-        let consumer_handle = tokio::spawn(async move { conn.start(message_tx).await });
+        let key_value = key.key().to_string();
+        let consumer_handle = tokio::spawn(async move { conn.start(message_tx, key).await });
         Ok(Self {
             room_id,
-            key,
+            key: key_value,
             pool,
             live_status,
             token_bucket,
@@ -365,6 +371,7 @@ async fn srv_fn(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let instance_id = uuid::Uuid::new_v4().to_string();
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
     if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
@@ -406,6 +413,8 @@ async fn main() -> Result<()> {
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
+    let room_key_cache = pgcache::RoomKeyCache::new(pool.clone(), &instance_id);
+
     for room_id in room_ids {
         let room_id = room_id.context("Invalid room ID")?;
         if room_id == 0 {
@@ -413,8 +422,14 @@ async fn main() -> Result<()> {
         }
 
         let pool_ref = pool.clone();
-        let mut rw =
-            RoomWatch::new(room_id, pool_ref, wbi_keys.clone(), token_bucket.clone()).await?;
+        let mut rw = RoomWatch::new(
+            room_id,
+            pool_ref,
+            wbi_keys.clone(),
+            &room_key_cache,
+            token_bucket.clone(),
+        )
+        .await?;
         set.spawn(async move { rw.run().await });
     }
 

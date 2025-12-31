@@ -8,13 +8,18 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- room_key_cache
 CREATE TABLE IF NOT EXISTS room_key_cache (
-    room_id     INTEGER     UNIQUE NOT NULL,
+    id          SERIAL      PRIMARY KEY,
+    room_id     INTEGER     NOT NULL,
     room_key    TEXT        NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expired     BOOLEAN     NOT NULL DEFAULT FALSE,
+    instance_id TEXT        NULL,
+    lease_until TIMESTAMPTZ NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_room_key_cache_room_id ON room_key_cache(room_id);
-CREATE INDEX IF NOT EXISTS idx_room_key_cache_updated_at ON room_key_cache(updated_at);
+CREATE INDEX room_key_cache_room_id_idx ON room_key_cache(room_id);
+CREATE INDEX room_key_cache_expired_idx ON room_key_cache(expired);
+CREATE INDEX room_key_cache_lease_until_idx ON room_key_cache(lease_until);
 
 --
 

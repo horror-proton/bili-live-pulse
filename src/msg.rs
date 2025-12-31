@@ -16,6 +16,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::protocol;
 
+use crate::pgcache;
 use crate::wbi;
 
 #[derive(serde::Deserialize)]
@@ -50,7 +51,7 @@ pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Re
 
     use reqwest::header::USER_AGENT;
 
-    debug!("Fetching room key from URL: {}", url);
+    info!("Fetching room key from URL: {}", url);
     let resp = reqwest::Client::new()
         .get(&url)
         .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
@@ -131,12 +132,12 @@ impl LiveMessage {
             LiveMessage::Heartbeat(data) => build_packet(
                 data,
                 Operation::Heartbeat as u32,
-                SEQUENCE.fetch_add(1, SeqCst),
+                1, // SEQUENCE.fetch_add(1, SeqCst),
             ),
             LiveMessage::Auth(data) => build_packet(
                 data.to_string().into_bytes(),
                 Operation::Auth as u32,
-                SEQUENCE.fetch_add(1, SeqCst),
+                1, // SEQUENCE.fetch_add(1, SeqCst),
             ),
             _ => vec![],
         }
@@ -372,7 +373,11 @@ impl MsgConnection {
         Ok(())
     }
 
-    pub async fn start(&mut self, message_tx: mpsc::Sender<LiveMessage>) -> Result<()> {
+    pub async fn start(
+        &mut self,
+        message_tx: mpsc::Sender<LiveMessage>,
+        key: pgcache::RoomKeyLease,
+    ) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         loop {
             tokio::select! {
@@ -390,6 +395,7 @@ impl MsgConnection {
                 },
 
                 _ = interval.tick() => {
+                    key.renew().await?;
                     let heartbeat_packet = LiveMessage::new_heartbeat().serialize();
                     if let Err(e) = self.write_stream
                         .send(protocol::Message::binary(heartbeat_packet))
