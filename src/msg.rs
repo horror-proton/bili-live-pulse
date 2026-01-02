@@ -15,9 +15,13 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::protocol;
+use tokio_util::sync::CancellationToken;
 
 use crate::pgcache;
 use crate::wbi;
+
+pub use pgcache::RoomKeyCache;
+pub use pgcache::RoomKeyLease;
 
 #[derive(serde::Deserialize)]
 struct DanmuInfoResult {
@@ -61,6 +65,7 @@ pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Re
         "Failed to parse getDanmuInfo response: {}",
         String::from_utf8_lossy(&resp)
     ))?;
+    // TODO: handle rate limit response: {"code":-352,"message":"-352","ttl":1}
 
     Ok(res.data.token)
 }
@@ -73,7 +78,7 @@ pub enum Operation {
     AuthReply = 8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum LiveMessage {
     Heartbeat(Vec<u8>),
     HeartbeatReply((u32, Vec<u8>)),
@@ -279,6 +284,15 @@ impl From<anyhow::Error> for MsgError {
     }
 }
 
+impl From<MsgError> for anyhow::Error {
+    fn from(err: MsgError) -> Self {
+        match err {
+            MsgError::AuthError => anyhow::anyhow!("Authentication error"),
+            MsgError::AnyhowError(e) => e,
+        }
+    }
+}
+
 impl MsgConnection {
     pub async fn new(
         roomid: u32,
@@ -375,12 +389,17 @@ impl MsgConnection {
 
     pub async fn start(
         &mut self,
+        cancel_token: CancellationToken,
         message_tx: mpsc::Sender<LiveMessage>,
-        key: pgcache::RoomKeyLease,
+        key: RoomKeyLease,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         loop {
             tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    break;
+                },
+
                 msg = self.read_stream.next() => {
                     // let msg: Option<std::result::Result<protocol::Message, tokio_tungstenite::tungstenite::Error>> = msg;
                     let pmsg = match msg {

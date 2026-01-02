@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use tokio::sync::mpsc;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 mod msg;
 use msg::LiveMessage;
@@ -19,6 +20,8 @@ mod token_bucket;
 use crate::token_bucket::TokenBucket;
 
 mod pgcache;
+
+mod channel_consistency;
 
 use log::{debug, error, info, trace, warn};
 
@@ -223,7 +226,7 @@ impl RoomWatch {
         room_id: u32,
         pool: sqlx::Pool<sqlx::Postgres>,
         wbi_keys: (String, String),
-        room_key_cache: &pgcache::RoomKeyCache,
+        room_key_cache: &msg::RoomKeyCache,
         token_bucket: Arc<TokenBucket>,
     ) -> Result<Self> {
         let live_status = LiveStatus {
@@ -244,7 +247,7 @@ impl RoomWatch {
             }
         };
 
-        let mut conn = loop {
+        let conn = loop {
             let conn = match msg::MsgConnection::new(room_id, key.key()).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
@@ -264,13 +267,20 @@ impl RoomWatch {
             break conn;
         };
 
+        info!(room_id; "Using key {}", key.key());
         // TODO: store new key here, after the connection is established
+
+        // there's as small chance that we get a nasty connection that returns less events
+        let mut conn = channel_consistency::ensure_connection(room_id, &key, Some(conn)).await?;
 
         info!(room_id; "WebSocket connection established");
 
         let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(10);
         let key_value = key.key().to_string();
-        let consumer_handle = tokio::spawn(async move { conn.start(message_tx, key).await });
+        let cancel_token = CancellationToken::new();
+        let ct = cancel_token.clone();
+        let consumer_handle =
+            tokio::spawn(async move { conn.start(ct, message_tx, key).await });
         Ok(Self {
             room_id,
             key: key_value,
@@ -413,7 +423,7 @@ async fn main() -> Result<()> {
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
-    let room_key_cache = pgcache::RoomKeyCache::new(pool.clone(), &instance_id);
+    let room_key_cache = msg::RoomKeyCache::new(pool.clone(), &instance_id);
 
     for room_id in room_ids {
         let room_id = room_id.context("Invalid room ID")?;
@@ -421,16 +431,23 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let pool_ref = pool.clone();
-        let mut rw = RoomWatch::new(
+        match RoomWatch::new(
             room_id,
-            pool_ref,
+            pool.clone(),
             wbi_keys.clone(),
             &room_key_cache,
             token_bucket.clone(),
         )
-        .await?;
-        set.spawn(async move { rw.run().await });
+        .await
+        {
+            Ok(mut rw) => {
+                set.spawn(async move { rw.run().await });
+            }
+            Err(e) => {
+                error!(room_id; "Failed to start RoomWatch: {:?}", e);
+                set.abort_all();
+            }
+        };
     }
 
     // TODO: Wait for all websocket connections to be ready

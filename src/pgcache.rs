@@ -77,7 +77,7 @@ impl RoomKeyCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RoomKeyLease {
     id: i32,
     key: String,
