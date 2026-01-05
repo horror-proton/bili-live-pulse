@@ -1,7 +1,10 @@
 use anyhow::Result;
 use log::{debug, error, info, trace, warn};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::{msg::LiveMessage, token_bucket};
 
 use super::msg;
 
@@ -14,7 +17,7 @@ impl ConnectionReplica {
     pub async fn new(
         mut connection: msg::MsgConnection,
         key: msg::RoomKeyLease,
-        message_tx: mpsc::Sender<msg::LiveMessage>,
+        message_tx: mpsc::Sender<LiveMessage>,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let ct_clone = cancel_token.clone();
@@ -23,7 +26,6 @@ impl ConnectionReplica {
             (connection, res)
         });
 
-        debug!("Spawned connection replica task");
         Self {
             cancel_token,
             handle: Some(handle),
@@ -37,7 +39,6 @@ impl ConnectionReplica {
     }
 
     pub fn cancel(&self) {
-        debug!("Cancelling connection replica");
         self.cancel_token.cancel();
     }
 }
@@ -54,6 +55,7 @@ impl Drop for ConnectionReplica {
 pub async fn ensure_connection(
     room_id: u32,
     key: &msg::RoomKeyLease,
+    token_bucket: &token_bucket::TokenBucket,
     mut existing: Option<msg::MsgConnection>,
 ) -> Result<msg::MsgConnection> {
     loop {
@@ -64,28 +66,47 @@ pub async fn ensure_connection(
 
         let rhs_c = msg::MsgConnection::new(room_id, key.key()).await?;
 
-        let (lhs_tx, mut lhs_rx) = mpsc::channel::<msg::LiveMessage>(5);
-        let (rhs_tx, mut rhs_rx) = mpsc::channel::<msg::LiveMessage>(5);
+        let (lhs_tx, mut lhs_rx) = mpsc::channel::<LiveMessage>(50);
+        let (rhs_tx, mut rhs_rx) = mpsc::channel::<LiveMessage>(50);
 
         let mut lhs = ConnectionReplica::new(lhs_c, key.clone(), lhs_tx).await;
         let mut rhs = ConnectionReplica::new(rhs_c, key.clone(), rhs_tx).await;
 
+        token_bucket.consume_one().await;
         info!(room_id; "Comparing connections");
-        let (l, r) = Comparator2::new(&mut lhs_rx, &mut rhs_rx).record().await;
+        let mut cmp =
+            Comparator2::new(&mut lhs_rx, &mut rhs_rx).with_filter(|m: &LiveMessage| match m {
+                LiveMessage::HeartbeatReply(_) => false,
+                LiveMessage::Message(Value::Object(obj)) => {
+                    if let Some(Value::String(s)) = obj.get("cmd") {
+                        if s == "LOG_IN_NOTICE" {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            });
+        let (l, r, i) = cmp.record().await;
+        info!(room_id; "Comparison results: lhs={} rhs={}", l, r);
 
-        if l <= 0.25 && r <= 0.25 {
+        if l <= 0.21 && r <= 0.21 {
             let (conn, _) = lhs.join().await?;
             return Ok(conn);
         }
 
-        warn!(room_id; "Inconsistent connections detected: lhs={} rhs={}", l, r);
+        let (lhs_msgs, rhs_msgs) = cmp.dump();
+        warn!(room_id; "Inconsistent connections detected: lhs={} ({}) rhs={} ({})", l, lhs_msgs.len(), r, rhs_msgs.len());
 
-        if l > r {
-            let (conn, _) = rhs.join().await?;
-            existing = Some(conn);
-        } else {
+        if i == 0 {
+            // lhs has more messages not in rhs, keep lhs
             let (conn, _) = lhs.join().await?;
             existing = Some(conn);
+            info!(room_id; "Keeping LHS connection");
+        } else {
+            let (conn, _) = rhs.join().await?;
+            existing = Some(conn);
+            info!(room_id; "Keeping RHS connection");
         }
     }
 }
@@ -104,6 +125,7 @@ where
 {
     receiver: &'a mut mpsc::Receiver<T>,
     buffer: Vec<T>,
+    filter: Option<fn(&T) -> bool>,
 }
 
 impl<T> ReceiverInfo<'_, T>
@@ -112,9 +134,18 @@ where
 {
     pub async fn recv(&mut self) -> Option<()> {
         self.receiver.recv().await.map(|m| {
-            debug!("Received message {:?}", m);
+            if let Some(filter) = self.filter {
+                if !filter(&m) {
+                    return;
+                }
+            }
+            debug!("Received message: {:?}", m);
             self.buffer.push(m);
         })
+    }
+
+    pub async fn clear(&mut self) {
+        while let Ok(_) = self.receiver.try_recv() {}
     }
 }
 
@@ -127,31 +158,45 @@ where
             lhs: ReceiverInfo {
                 receiver: lhs,
                 buffer: Vec::new(),
+                filter: None,
             },
             rhs: ReceiverInfo {
                 receiver: rhs,
                 buffer: Vec::new(),
+                filter: None,
             },
         }
     }
 
+    pub fn with_filter(mut self, filter: fn(&T) -> bool) -> Self {
+        self.lhs.filter = Some(filter);
+        self.rhs.filter = Some(filter);
+        self
+    }
+
+    pub fn dump(self) -> (Vec<T>, Vec<T>) {
+        (self.lhs.buffer, self.rhs.buffer)
+    }
+
     // TODO: return receivers instead of using refs
-    pub async fn record(&mut self) -> (f64, f64) {
+    pub async fn record(&mut self) -> (f64, f64, i32) {
         let max_length = 20;
 
         use tokio::time;
 
-        let timeout = time::Instant::now() + time::Duration::from_secs(30);
+        self.lhs.clear().await;
+        self.rhs.clear().await;
+
+        let timeout = time::Instant::now() + time::Duration::from_secs(60 * 5);
+        let mut print_interval = time::interval(time::Duration::from_secs(30));
         loop {
             tokio::select! {
                 _ = self.lhs.recv() => {
-                    debug!("LHS length {}", self.lhs.buffer.len());
                     if self.lhs.buffer.len() >= max_length {
                         break;
                     }
                 }
                 _ = self.rhs.recv() => {
-                    debug!("RHS length {}", self.rhs.buffer.len());
                     if self.rhs.buffer.len() >= max_length {
                         break;
                     }
@@ -159,6 +204,9 @@ where
                 _ = time::sleep_until(timeout) => {
                     debug!("Timeout reached while recording messages");
                     break;
+                }
+                _ = print_interval.tick() => {
+                    debug!("Recording messages: lhs={} rhs={}", self.lhs.buffer.len(), self.rhs.buffer.len());
                 }
             }
         }
@@ -168,21 +216,29 @@ where
         let lhs_exclusive = self.lhs.buffer.len() - lcs_length;
         let rhs_exclusive = self.rhs.buffer.len() - lcs_length;
 
+        // FIXME: better return type, e.g. Enum
+        let prefer = if self.lhs.buffer.len() > self.rhs.buffer.len() {
+            0
+        } else {
+            1
+        };
+
         if self.lhs.buffer.is_empty() && self.rhs.buffer.is_empty() {
-            return (1.0, 1.0);
+            return (1.0, 1.0, prefer);
         }
 
         if self.lhs.buffer.is_empty() {
-            return (0.0, 1.0);
+            return (0.0, 1.0, prefer);
         }
 
         if self.rhs.buffer.is_empty() {
-            return (1.0, 0.0);
+            return (1.0, 0.0, prefer);
         }
 
         (
             lhs_exclusive as f64 / self.lhs.buffer.len() as f64,
             rhs_exclusive as f64 / self.rhs.buffer.len() as f64,
+            prefer,
         )
     }
 }
