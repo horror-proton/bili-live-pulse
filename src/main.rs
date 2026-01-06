@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio::sync::Mutex;
 
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -218,7 +218,8 @@ struct RoomWatch {
     live_status: LiveStatus,
     token_bucket: Arc<TokenBucket>,
 
-    message_rx: mpsc::Receiver<msg::LiveMessage>,
+    message_tx: broadcast::Sender<msg::LiveMessage>,
+    message_rx: broadcast::Receiver<msg::LiveMessage>,
     consumer_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
@@ -279,17 +280,19 @@ impl RoomWatch {
 
         info!(room_id; "WebSocket connection established");
 
-        let (message_tx, message_rx) = mpsc::channel::<msg::LiveMessage>(10);
+        let (message_tx, message_rx) = broadcast::channel::<msg::LiveMessage>(20);
         let key_value = key.key().to_string();
         let cancel_token = CancellationToken::new();
         let ct = cancel_token.clone();
-        let consumer_handle = tokio::spawn(async move { conn.start(ct, message_tx, key).await });
+        let tx_clone = message_tx.clone();
+        let consumer_handle = tokio::spawn(async move { conn.start(ct, tx_clone, key).await });
         Ok(Self {
             room_id,
             key: key_value,
             pool,
             live_status,
             token_bucket,
+            message_tx,
             message_rx,
             consumer_handle,
         })
@@ -328,8 +331,13 @@ impl RoomWatch {
                     return ch?;
                 },
 
-                Some(m) = self.message_rx.recv() => {
-                    self.live_status.handle_msg(self.room_id, &m, &self.pool).await?;
+                m = self.message_rx.recv() => {
+                    match m {
+                        Ok(m) => self.live_status.handle_msg(self.room_id, &m, &self.pool).await?,
+                        Err(broadcast::error::RecvError::Lagged(n)) => warn!(room_id; "Missed {} messages", n),
+                        Err(e) => Err(e)?,
+                    }
+
                 },
 
                 _ = time::sleep_until(next_concile) => {

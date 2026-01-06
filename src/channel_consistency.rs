@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{debug, error, info, trace, warn};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::{msg::LiveMessage, token_bucket};
@@ -17,7 +17,7 @@ impl ConnectionReplica {
     pub async fn new(
         mut connection: msg::MsgConnection,
         key: msg::RoomKeyLease,
-        message_tx: mpsc::Sender<LiveMessage>,
+        message_tx: broadcast::Sender<LiveMessage>,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let ct_clone = cancel_token.clone();
@@ -66,27 +66,26 @@ pub async fn ensure_connection(
 
         let rhs_c = msg::MsgConnection::new(room_id, key.key()).await?;
 
-        let (lhs_tx, mut lhs_rx) = mpsc::channel::<LiveMessage>(50);
-        let (rhs_tx, mut rhs_rx) = mpsc::channel::<LiveMessage>(50);
+        let (lhs_tx, lhs_rx) = broadcast::channel::<LiveMessage>(1);
+        let (rhs_tx, rhs_rx) = broadcast::channel::<LiveMessage>(1);
 
         let mut lhs = ConnectionReplica::new(lhs_c, key.clone(), lhs_tx).await;
         let mut rhs = ConnectionReplica::new(rhs_c, key.clone(), rhs_tx).await;
 
         token_bucket.consume_one().await;
         info!(room_id; "Comparing connections");
-        let mut cmp =
-            Comparator2::new(&mut lhs_rx, &mut rhs_rx).with_filter(|m: &LiveMessage| match m {
-                LiveMessage::HeartbeatReply(_) => false,
-                LiveMessage::Message(Value::Object(obj)) => {
-                    if let Some(Value::String(s)) = obj.get("cmd") {
-                        if s == "LOG_IN_NOTICE" {
-                            return false;
-                        }
+        let mut cmp = Comparator2::new(lhs_rx, rhs_rx).with_filter(|m: &LiveMessage| match m {
+            LiveMessage::HeartbeatReply(_) => false,
+            LiveMessage::Message(Value::Object(obj)) => {
+                if let Some(Value::String(s)) = obj.get("cmd") {
+                    if s == "LOG_IN_NOTICE" {
+                        return false;
                     }
-                    true
                 }
-                _ => true,
-            });
+                true
+            }
+            _ => true,
+        });
         let (l, r, i) = cmp.record().await;
         info!(room_id; "Comparison results: lhs={} rhs={}", l, r);
 
@@ -100,40 +99,40 @@ pub async fn ensure_connection(
 
         if i == 0 {
             // lhs has more messages not in rhs, keep lhs
+            debug!(room_id; "Keeping LHS connection");
             let (conn, _) = lhs.join().await?;
             existing = Some(conn);
-            info!(room_id; "Keeping LHS connection");
         } else {
+            debug!(room_id; "Keeping RHS connection");
             let (conn, _) = rhs.join().await?;
             existing = Some(conn);
-            info!(room_id; "Keeping RHS connection");
         }
     }
 }
 
-struct Comparator2<'a, T>
+struct Comparator2<T>
 where
     T: std::fmt::Debug,
 {
-    lhs: ReceiverInfo<'a, T>,
-    rhs: ReceiverInfo<'a, T>,
+    lhs: ReceiverInfo<T>,
+    rhs: ReceiverInfo<T>,
 }
 
-struct ReceiverInfo<'a, T>
+struct ReceiverInfo<T>
 where
     T: std::fmt::Debug,
 {
-    receiver: &'a mut mpsc::Receiver<T>,
+    receiver: broadcast::Receiver<T>,
     buffer: Vec<T>,
     filter: Option<fn(&T) -> bool>,
 }
 
-impl<T> ReceiverInfo<'_, T>
+impl<T> ReceiverInfo<T>
 where
-    T: std::fmt::Debug,
+    T: std::fmt::Debug + Clone,
 {
-    pub async fn recv(&mut self) -> Option<()> {
-        self.receiver.recv().await.map(|m| {
+    pub async fn recv(&mut self) -> () {
+        if let Ok(m) = self.receiver.recv().await {
             if let Some(filter) = self.filter {
                 if !filter(&m) {
                     return;
@@ -141,19 +140,19 @@ where
             }
             debug!("Received message: {:?}", m);
             self.buffer.push(m);
-        })
+        }
     }
 
     pub async fn clear(&mut self) {
-        while let Ok(_) = self.receiver.try_recv() {}
+        self.receiver = self.receiver.resubscribe();
     }
 }
 
-impl<'a, T> Comparator2<'a, T>
+impl<T> Comparator2<T>
 where
-    T: Eq + std::fmt::Debug,
+    T: Eq + std::fmt::Debug + Clone,
 {
-    pub fn new(lhs: &'a mut mpsc::Receiver<T>, rhs: &'a mut mpsc::Receiver<T>) -> Self {
+    pub fn new(lhs: broadcast::Receiver<T>, rhs: broadcast::Receiver<T>) -> Self {
         Self {
             lhs: ReceiverInfo {
                 receiver: lhs,

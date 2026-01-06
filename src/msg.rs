@@ -9,7 +9,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
@@ -78,7 +78,7 @@ pub enum Operation {
     AuthReply = 8,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveMessage {
     Heartbeat(Vec<u8>),
     HeartbeatReply((u32, Vec<u8>)),
@@ -294,11 +294,7 @@ impl From<MsgError> for anyhow::Error {
 }
 
 impl MsgConnection {
-    pub async fn new(
-        roomid: u32,
-        key: &str,
-        // message_tx: mpsc::Sender<LiveMessage>,
-    ) -> std::result::Result<Self, MsgError> {
+    pub async fn new(roomid: u32, key: &str) -> std::result::Result<Self, MsgError> {
         use reqwest::header::{
             CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE, USER_AGENT,
         };
@@ -359,21 +355,24 @@ impl MsgConnection {
             write_stream: write,
             sequence: AtomicU32::new(1),
             heartbeat_pending,
-            // message_tx,
         })
     }
 
     async fn forward_one(
         &mut self,
         pmsg: protocol::Message,
-        message_tx: &mpsc::Sender<LiveMessage>,
+        message_tx: &broadcast::Sender<LiveMessage>,
     ) -> Result<()> {
         let bin = match pmsg {
             protocol::Message::Binary(b) => b,
             _ => return Ok(()),
         };
 
-        for (data, op) in decompress_packet(&bin)? {
+        let decompressed = decompress_packet(&bin)?;
+        if decompressed.len() > 10 {
+            warn!("Decompressed into {} packets", decompressed.len());
+        }
+        for (data, op) in decompressed {
             let live_msg = LiveMessage::from_payload(&data, op);
 
             if let LiveMessage::HeartbeatReply(_) = &live_msg {
@@ -381,7 +380,12 @@ impl MsgConnection {
                 self.handle_heartbeat_reply();
             }
 
-            message_tx.send(live_msg).await?;
+            if let Err(_) = message_tx.send(live_msg) {
+                debug!("No active receivers");
+            }
+
+            // prevent filling up message_tx before other tasks to get a chance to process them
+            tokio::task::yield_now().await;
         }
 
         Ok(())
@@ -390,7 +394,7 @@ impl MsgConnection {
     pub async fn start(
         &mut self,
         cancel_token: CancellationToken,
-        message_tx: mpsc::Sender<LiveMessage>,
+        message_tx: broadcast::Sender<LiveMessage>,
         key: RoomKeyLease,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
