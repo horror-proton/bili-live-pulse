@@ -1,12 +1,13 @@
+use anyhow;
 use anyhow::Result;
 use log::{debug, error, info, trace, warn};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{msg::LiveMessage, token_bucket};
+use crate::{msg::LiveMessage, utils};
 
-use super::msg;
+use crate::msg;
 
 struct ConnectionReplica {
     cancel_token: CancellationToken,
@@ -51,21 +52,39 @@ impl Drop for ConnectionReplica {
     }
 }
 
-// TODO: which to return, connection or channel?
+type ErrorType = utils::backoff::RetryOrError<Option<msg::MsgConnection>, anyhow::Error>;
+
 pub async fn ensure_connection(
+    rl: &utils::backoff::RateLimiter,
     room_id: u32,
     key: &msg::RoomKeyLease,
     buvid: &str,
-    token_bucket: &token_bucket::TokenBucket,
-    mut existing: Option<msg::MsgConnection>,
+    existing: Option<msg::MsgConnection>,
 ) -> Result<msg::MsgConnection> {
-    loop {
+    rl.call_with_retry(existing, |existing| {
+        ensure_connection_impl(room_id, key, buvid, existing)
+    })
+    .await
+}
+
+// TODO: which to return, connection or channel?
+async fn ensure_connection_impl(
+    room_id: u32,
+    key: &msg::RoomKeyLease,
+    buvid: &str,
+    existing: Option<msg::MsgConnection>,
+) -> std::result::Result<msg::MsgConnection, ErrorType> {
+    {
         let lhs_c = match existing {
             Some(conn) => conn,
-            None => msg::MsgConnection::new(room_id, key.key(), buvid).await?,
+            None => msg::MsgConnection::new(room_id, key.key(), buvid)
+                .await
+                .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?,
         };
 
-        let rhs_c = msg::MsgConnection::new(room_id, key.key(), buvid).await?;
+        let rhs_c = msg::MsgConnection::new(room_id, key.key(), buvid)
+            .await
+            .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?;
 
         let (lhs_tx, lhs_rx) = broadcast::channel::<LiveMessage>(1);
         let (rhs_tx, rhs_rx) = broadcast::channel::<LiveMessage>(1);
@@ -73,7 +92,6 @@ pub async fn ensure_connection(
         let mut lhs = ConnectionReplica::new(lhs_c, key.clone(), lhs_tx).await;
         let mut rhs = ConnectionReplica::new(rhs_c, key.clone(), rhs_tx).await;
 
-        token_bucket.consume_one().await;
         info!(room_id; "Comparing connections");
         let mut cmp = Comparator2::new(lhs_rx, rhs_rx).with_filter(|m: &LiveMessage| match m {
             LiveMessage::HeartbeatReply(_) => false,
@@ -91,7 +109,7 @@ pub async fn ensure_connection(
         info!(room_id; "Comparison results: lhs={} rhs={}", l, r);
 
         if l >= 0.79 && r >= 0.79 {
-            let (conn, _) = lhs.join().await?;
+            let (conn, _) = lhs.join().await.map_err(|e| ErrorType::Error(e))?;
             return Ok(conn);
         }
 
@@ -101,12 +119,12 @@ pub async fn ensure_connection(
         if l < r {
             // lhs has more messages not in rhs, keep lhs
             debug!(room_id; "Keeping LHS connection");
-            let (conn, _) = lhs.join().await?;
-            existing = Some(conn);
+            let (conn, _) = lhs.join().await.map_err(|e| ErrorType::Error(e))?;
+            return Err(ErrorType::Retry(Some(conn)));
         } else {
             debug!(room_id; "Keeping RHS connection");
-            let (conn, _) = rhs.join().await?;
-            existing = Some(conn);
+            let (conn, _) = rhs.join().await.map_err(|e| ErrorType::Error(e))?;
+            return Err(ErrorType::Retry(Some(conn)));
         }
     }
 }

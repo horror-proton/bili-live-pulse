@@ -9,6 +9,8 @@ use tokio::sync::broadcast;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+mod utils;
+
 mod msg;
 use msg::LiveMessage;
 
@@ -21,8 +23,6 @@ mod token_bucket;
 use crate::token_bucket::TokenBucket;
 
 mod pgcache;
-
-mod channel_consistency;
 
 use log::{debug, error, info, trace, warn};
 
@@ -251,7 +251,6 @@ impl RoomWatch {
         buvid: &str,
         room_key_cache: &msg::RoomKeyCache,
         token_bucket: Arc<TokenBucket>,
-        msg_token_bucket: Arc<TokenBucket>,
     ) -> Result<Self> {
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
@@ -272,7 +271,6 @@ impl RoomWatch {
         };
 
         let conn = loop {
-            msg_token_bucket.consume_one().await;
             let conn = match msg::MsgConnection::new(room_id, key.key(), buvid).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
@@ -295,15 +293,13 @@ impl RoomWatch {
         info!(room_id; "Using key {}", key.key());
         // TODO: store new key here, after the connection is established
 
+        use utils::channel_consistency::ensure_connection;
+        use utils::backoff::RateLimiter;
+
+        let rl = RateLimiter::default();
+
         // there's as small chance that we get a nasty connection that returns less events
-        let mut conn = channel_consistency::ensure_connection(
-            room_id,
-            &key,
-            buvid,
-            &msg_token_bucket,
-            Some(conn),
-        )
-        .await?;
+        let mut conn = ensure_connection(&rl, room_id, &key, buvid, Some(conn)).await?;
 
         info!(room_id; "WebSocket connection established");
 
@@ -454,7 +450,8 @@ async fn main() -> Result<()> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<u32>().ok())
-        .filter(|s| *s != 0);
+        .filter(|s| *s != 0)
+        .collect::<Vec<u32>>();
 
     let set = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
 
@@ -465,36 +462,35 @@ async fn main() -> Result<()> {
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
-    let mut init_set = tokio::task::JoinSet::new();
 
-    let msg_token_bucket = TokenBucket::new(5, 1);
+    for chunk in room_ids.chunks(10) {
+        let mut init_set = tokio::task::JoinSet::new();
+        for room_id in chunk {
+            let pool = pool.clone();
+            let wbi_keys = wbi_keys.clone();
+            let token_bucket = token_bucket.clone();
+            let room_key_cache = room_key_cache.clone();
+            let set = set.clone();
+            let buvid = buvid.clone();
+            let room_id = *room_id;
 
-    for room_id in room_ids {
-        let pool = pool.clone();
-        let wbi_keys = wbi_keys.clone();
-        let token_bucket = token_bucket.clone();
-        let msg_token_bucket = msg_token_bucket.clone();
-        let room_key_cache = room_key_cache.clone();
-        let set = set.clone();
-        let buvid = buvid.clone();
-
-            let mut rw = RoomWatch::new(room_id, pool, wbi_keys, &room_key_cache, token_bucket)
-            let mut rw = RoomWatch::new(
-                room_id,
-                pool,
-                wbi_keys,
-                &buvid,
-                &room_key_cache,
-                token_bucket,
-                msg_token_bucket,
-            )
-            .await
-            .unwrap();
-            set.lock().await.spawn(async move { rw.run().await });
-        });
+            init_set.spawn(async move {
+                let mut rw = RoomWatch::new(
+                    room_id,
+                    pool,
+                    wbi_keys,
+                    &buvid,
+                    &room_key_cache,
+                    token_bucket,
+                )
+                .await
+                .unwrap();
+                set.lock().await.spawn(async move { rw.run().await });
+            });
+        }
+        init_set.join_all().await;
     }
 
-    init_set.join_all().await;
     info!("All RoomWatch initialized");
     READY.store(true, Ordering::SeqCst);
 
