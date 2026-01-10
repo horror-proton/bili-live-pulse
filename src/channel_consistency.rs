@@ -55,16 +55,17 @@ impl Drop for ConnectionReplica {
 pub async fn ensure_connection(
     room_id: u32,
     key: &msg::RoomKeyLease,
+    buvid: &str,
     token_bucket: &token_bucket::TokenBucket,
     mut existing: Option<msg::MsgConnection>,
 ) -> Result<msg::MsgConnection> {
     loop {
         let lhs_c = match existing {
             Some(conn) => conn,
-            None => msg::MsgConnection::new(room_id, key.key()).await?,
+            None => msg::MsgConnection::new(room_id, key.key(), buvid).await?,
         };
 
-        let rhs_c = msg::MsgConnection::new(room_id, key.key()).await?;
+        let rhs_c = msg::MsgConnection::new(room_id, key.key(), buvid).await?;
 
         let (lhs_tx, lhs_rx) = broadcast::channel::<LiveMessage>(1);
         let (rhs_tx, rhs_rx) = broadcast::channel::<LiveMessage>(1);
@@ -86,10 +87,10 @@ pub async fn ensure_connection(
             }
             _ => true,
         });
-        let (l, r, i) = cmp.record().await;
+        let (l, r) = cmp.record().await;
         info!(room_id; "Comparison results: lhs={} rhs={}", l, r);
 
-        if l <= 0.21 && r <= 0.21 {
+        if l >= 0.79 && r >= 0.79 {
             let (conn, _) = lhs.join().await?;
             return Ok(conn);
         }
@@ -97,7 +98,7 @@ pub async fn ensure_connection(
         let (lhs_msgs, rhs_msgs) = cmp.dump();
         warn!(room_id; "Inconsistent connections detected: lhs={} ({}) rhs={} ({})", l, lhs_msgs.len(), r, rhs_msgs.len());
 
-        if i == 0 {
+        if l < r {
             // lhs has more messages not in rhs, keep lhs
             debug!(room_id; "Keeping LHS connection");
             let (conn, _) = lhs.join().await?;
@@ -178,7 +179,7 @@ where
     }
 
     // TODO: return receivers instead of using refs
-    pub async fn record(&mut self) -> (f64, f64, i32) {
+    pub async fn record(&mut self) -> (f64, f64) {
         let max_length = 20;
 
         use tokio::time;
@@ -212,32 +213,21 @@ where
 
         let lcs_length = longest_common_subsequence(&self.lhs.buffer, &self.rhs.buffer);
 
-        let lhs_exclusive = self.lhs.buffer.len() - lcs_length;
-        let rhs_exclusive = self.rhs.buffer.len() - lcs_length;
-
-        // FIXME: better return type, e.g. Enum
-        let prefer = if self.lhs.buffer.len() > self.rhs.buffer.len() {
-            0
-        } else {
-            1
-        };
-
         if self.lhs.buffer.is_empty() && self.rhs.buffer.is_empty() {
-            return (1.0, 1.0, prefer);
+            return (0., 0.);
         }
 
         if self.lhs.buffer.is_empty() {
-            return (0.0, 1.0, prefer);
+            return (1.0, 0.0);
         }
 
         if self.rhs.buffer.is_empty() {
-            return (1.0, 0.0, prefer);
+            return (0.0, 1.0);
         }
 
         (
-            lhs_exclusive as f64 / self.lhs.buffer.len() as f64,
-            rhs_exclusive as f64 / self.rhs.buffer.len() as f64,
-            prefer,
+            lcs_length as f64 / self.lhs.buffer.len() as f64,
+            lcs_length as f64 / self.rhs.buffer.len() as f64,
         )
     }
 }

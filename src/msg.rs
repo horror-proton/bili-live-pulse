@@ -148,14 +148,25 @@ impl LiveMessage {
         }
     }
 
-    pub fn new_auth(roomid: u32, key: &str) -> Self {
+    pub fn new_auth(roomid: u32, key: &str, buvid: &str) -> Self {
+        // Math.random().toString(36).slice(-8)
+        let rand_id: String = (0..8)
+            .map(|_| {
+                let r = fastrand::u8(..36);
+                if r < 10 {
+                    (b'0' + r) as char
+                } else {
+                    (b'a' + (r - 10)) as char
+                }
+            })
+            .collect();
         let result = json!({
             "uid":0,
             "roomid":roomid,
             "protover":3,
-            // "buvid":"",
+            "buvid": buvid,
             "support_ack":true,
-            // "queue_uuid":"",
+            "queue_uuid": rand_id,
             "scene":"room",
             "platform":"web",
             "type":2,
@@ -294,23 +305,26 @@ impl From<MsgError> for anyhow::Error {
 }
 
 impl MsgConnection {
-    pub async fn new(roomid: u32, key: &str) -> std::result::Result<Self, MsgError> {
-        use reqwest::header::{
-            CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE, USER_AGENT,
-        };
+    pub async fn new(roomid: u32, key: &str, buvid: &str) -> std::result::Result<Self, MsgError> {
+        use reqwest::header::*;
 
         let url = "wss://broadcastlv.chat.bilibili.com:443/sub";
         let req = Request::builder()
             .method("GET")
             .uri(url)
             .header(HOST, "broadcastlv.chat.bilibili.com")
+            .header(ORIGIN, "https://live.bilibili.com")
+            .header(ACCEPT, "*/*")
+            .header(ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(ACCEPT_ENCODING, "gzip, deflate, zstd")
             .header(UPGRADE, "websocket")
             .header(CONNECTION, "Upgrade")
             .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_EXTENSIONS, "permessage-deflate")
             .header(SEC_WEBSOCKET_KEY, "chat")
             .header(
                 USER_AGENT,
-                "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
+                "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             )
             .body(())
             .unwrap();
@@ -319,7 +333,7 @@ impl MsgConnection {
 
         let (mut write, mut read_stream) = ws_stream.split();
 
-        let auth_msg = LiveMessage::new_auth(roomid, key).serialize();
+        let auth_msg = LiveMessage::new_auth(roomid, key, buvid).serialize();
         write
             .send(protocol::Message::binary(auth_msg))
             .await

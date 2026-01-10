@@ -23,6 +23,7 @@ hex = "0"
 uuid = { version = "1", features = ["v4"] }
 log = "0"
 env_logger = { version = "0", features = ["kv"] }
+fastrand = "2"
 
 [dev-dependencies]
 regex = "1"
