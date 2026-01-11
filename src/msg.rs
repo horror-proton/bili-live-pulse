@@ -18,57 +18,9 @@ use tokio_tungstenite::tungstenite::protocol;
 use tokio_util::sync::CancellationToken;
 
 use crate::pgcache;
-use crate::wbi;
 
 pub use pgcache::RoomKeyCache;
 pub use pgcache::RoomKeyLease;
-
-#[derive(serde::Deserialize)]
-struct DanmuInfoResult {
-    data: DanmuInfoResultData,
-}
-
-#[derive(serde::Deserialize)]
-struct DanmuInfoResultData {
-    token: String,
-}
-
-pub async fn get_room_key(roomid: u32, wbi_keys: Option<(String, String)>) -> Result<String> {
-    let keys = match wbi_keys {
-        Some(k) => k,
-        None => wbi::get_wbi_keys().await?,
-    };
-
-    let params = wbi::encode_wbi(
-        vec![
-            ("id", roomid.to_string()),
-            ("type", "0".to_string()),
-            ("web_location", "444.8".to_string()),
-        ],
-        keys,
-    );
-
-    let url = format!(
-        "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?{}",
-        params
-    );
-
-    use reqwest::header::USER_AGENT;
-
-    info!("Fetching room key from URL: {}", url);
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-        .send()
-        .await?.bytes().await?;
-    let res = serde_json::from_slice::<DanmuInfoResult>(&resp).context(format!(
-        "Failed to parse getDanmuInfo response: {}",
-        String::from_utf8_lossy(&resp)
-    ))?;
-    // TODO: handle rate limit response: {"code":-352,"message":"-352","ttl":1}
-
-    Ok(res.data.token)
-}
 
 pub enum Operation {
     Heartbeat = 2,

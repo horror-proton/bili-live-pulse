@@ -10,9 +10,12 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 mod utils;
+use utils::backoff::RateLimiter;
 
 mod msg;
 use msg::LiveMessage;
+
+mod client;
 
 mod model;
 use crate::model::FromMsg;
@@ -189,47 +192,6 @@ impl LiveStatus {
     }
 }
 
-async fn get_api_live_status(room_id: u32) -> Result<model::RoomInfo> {
-    let cli = reqwest::Client::new();
-    let resp = cli
-        .get("https://api.live.bilibili.com/room/v1/Room/get_info")
-        .query(&[("room_id", room_id)])
-        .send()
-        .await?
-        .bytes() // .json()
-        .await?;
-
-    let resp = serde_json::from_slice::<serde_json::Value>(&resp).context(format!(
-        "Missing data field in API response: {}",
-        String::from_utf8_lossy(&resp)
-    ))?;
-
-    model::RoomInfo::from_api_result(room_id, &resp).context(format!(
-        "Failed to parse info of room {}: {} ",
-        room_id, resp
-    ))
-}
-
-async fn get_buvidv3() -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct RespData {
-        b_3: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Resp {
-        data: RespData,
-    }
-
-    let resp = reqwest::Client::new()
-        .get("https://api.bilibili.com/x/frontend/finger/spi")
-        .send()
-        .await?
-        .json::<Resp>()
-        .await?;
-    Ok(resp.data.b_3)
-}
-
 struct RoomWatch {
     room_id: u32,
     key: String,
@@ -251,6 +213,8 @@ impl RoomWatch {
         buvid: &str,
         room_key_cache: &msg::RoomKeyCache,
         token_bucket: Arc<TokenBucket>,
+        api_rl: &RateLimiter,
+        msg_rl: &RateLimiter,
     ) -> Result<Self> {
         let live_status = LiveStatus {
             live_status: Arc::new(AtomicI32::new(0)),
@@ -262,8 +226,8 @@ impl RoomWatch {
         let mut key = match room_key_cache.try_get(room_id as i32).await? {
             Some(k) => k,
             None => {
-                token_bucket.consume_one().await;
-                let new_key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                let new_key =
+                    client::fetch_room_key(api_rl, room_id, Some(wbi_keys.clone())).await?;
                 room_key_cache
                     .insert_and_get(room_id as i32, &new_key)
                     .await?
@@ -276,8 +240,8 @@ impl RoomWatch {
                 Err(msg::MsgError::AuthError) => {
                     warn!(room_id; "Auth error renewing key {:?}", key);
                     key.invalidate().await?;
-                    token_bucket.consume_one().await;
-                    let new_key = msg::get_room_key(room_id, Some(wbi_keys.clone())).await?;
+                    let new_key =
+                        client::fetch_room_key(api_rl, room_id, Some(wbi_keys.clone())).await?;
                     key = room_key_cache
                         .insert_and_get(room_id as i32, &new_key)
                         .await?;
@@ -294,12 +258,9 @@ impl RoomWatch {
         // TODO: store new key here, after the connection is established
 
         use utils::channel_consistency::ensure_connection;
-        use utils::backoff::RateLimiter;
-
-        let rl = RateLimiter::default();
 
         // there's as small chance that we get a nasty connection that returns less events
-        let mut conn = ensure_connection(&rl, room_id, &key, buvid, Some(conn)).await?;
+        let mut conn = ensure_connection(&msg_rl, room_id, &key, buvid, Some(conn)).await?;
 
         info!(room_id; "WebSocket connection established");
 
@@ -322,7 +283,7 @@ impl RoomWatch {
     }
 
     async fn concile_status(&mut self) -> Result<model::RoomInfo> {
-        let room_info = get_api_live_status(self.room_id).await?;
+        let room_info = client::fetch_live_status(self.room_id).await?;
 
         let status = room_info.live_status.unwrap() as i32;
         self.live_status.live_id_str = room_info.up_session.clone();
@@ -456,14 +417,17 @@ async fn main() -> Result<()> {
     let set = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
 
     let token_bucket = TokenBucket::new(10, 5);
-    let buvid = get_buvidv3().await?;
+    let buvid = client::fetch_buvidv3().await?;
     info!("Fetched buvid: {}", buvid);
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
 
-    for chunk in room_ids.chunks(10) {
+    let api_rl = Arc::new(RateLimiter::default());
+    let msg_rl = Arc::new(RateLimiter::default());
+
+    for chunk in room_ids.chunks(50) {
         let mut init_set = tokio::task::JoinSet::new();
         for room_id in chunk {
             let pool = pool.clone();
@@ -473,6 +437,8 @@ async fn main() -> Result<()> {
             let set = set.clone();
             let buvid = buvid.clone();
             let room_id = *room_id;
+            let api_rl = api_rl.clone();
+            let msg_rl = msg_rl.clone();
 
             init_set.spawn(async move {
                 let mut rw = RoomWatch::new(
@@ -482,6 +448,8 @@ async fn main() -> Result<()> {
                     &buvid,
                     &room_key_cache,
                     token_bucket,
+                    &api_rl,
+                    &msg_rl,
                 )
                 .await
                 .unwrap();
