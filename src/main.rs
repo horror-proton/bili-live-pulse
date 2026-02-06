@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
 
 use sqlx::postgres::PgPoolOptions;
 
@@ -96,15 +97,23 @@ async fn main() -> Result<()> {
     use supervisor::Supervisor;
 
     let sup = Arc::new(Supervisor::new(pool.clone(), wbi_keys, buvid));
-    for chunk in room_ids.chunks(20) {
-        let mut set = tokio::task::JoinSet::new();
-        for room_id in chunk {
-            let room_id = *room_id;
-            let sup = sup.clone();
-            let live_status = Arc::new(live_status::LiveStatus::new(room_id, pool.clone()));
-            set.spawn(async move { sup.add_room(room_id, live_status).await });
+    let sem = Arc::new(Semaphore::new(20));
+    let mut set = tokio::task::JoinSet::new();
+
+    for room_id in room_ids {
+        let sup = sup.clone();
+        let live_status = Arc::new(live_status::LiveStatus::new(room_id, pool.clone()));
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            sup.add_room_blocking(room_id, live_status).await
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            error!("failed to join task: {}", e);
         }
-        set.join_all().await;
     }
     info!("All RoomWatch initialized");
     READY.store(true, Ordering::SeqCst);

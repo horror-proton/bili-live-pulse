@@ -113,7 +113,11 @@ impl Supervisor {
     }
 
     /// Adds a new room to be supervised.
-    pub async fn add_room(&self, room_id: u32, live_status: Arc<LiveStatus>) -> Result<()> {
+    pub async fn add_room_blocking(
+        &self,
+        room_id: u32,
+        live_status: Arc<LiveStatus>,
+    ) -> Result<()> {
         info!(room_id; "Adding room {} to supervision.", room_id);
 
         let mut supervisees = self.supervisees.lock().await;

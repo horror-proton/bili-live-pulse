@@ -281,7 +281,7 @@ impl MsgConnection {
             .body(())
             .unwrap();
 
-        let (ws_stream, _) = connect_async(req).await.expect("Failed to connect");
+        let (ws_stream, _) = connect_async(req).await.context("Failed to connect")?;
 
         let (mut write, mut read_stream) = ws_stream.split();
 
@@ -294,7 +294,7 @@ impl MsgConnection {
         let rsp = read_stream
             .next()
             .await
-            .expect("Failed to read message")
+            .context("Failed to read message")?
             .map_err(|e| match e {
                 tungstenite::Error::Protocol(_) => MsgError::AuthError,
                 _ => MsgError::AnyhowError(anyhow::anyhow!(e)),
