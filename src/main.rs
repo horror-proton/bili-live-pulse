@@ -89,15 +89,19 @@ async fn main() -> Result<()> {
         .filter(|s| *s != 0)
         .collect::<Vec<u32>>();
 
-    let buvid = client::fetch_buvidv3().await?;
-    info!("Fetched buvid: {}", buvid);
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
+    let cli = Arc::new(client::ApiClient::new(wbi_keys.clone()));
 
     use supervisor::Supervisor;
 
-    let sup = Arc::new(Supervisor::new(pool.clone(), wbi_keys, buvid));
-    let sem = Arc::new(Semaphore::new(20));
+    let attempt_n = std::env::var("LIVE_CONCURRENT_ATTEMPT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5);
+
+    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone()));
+    let sem = Arc::new(Semaphore::new(attempt_n));
     let mut set = tokio::task::JoinSet::new();
 
     for room_id in room_ids {

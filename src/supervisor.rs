@@ -11,12 +11,10 @@ use tokio::sync::broadcast;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration};
 
-// use crate::live_status;
+use crate::client::ApiClient;
 use crate::live_status::LiveStatus;
 use crate::msg;
 use crate::room_watch;
-use crate::utils::backoff;
-use backoff::RateLimiter;
 
 use room_watch::RoomWatch;
 
@@ -29,15 +27,12 @@ struct Supervisee {
 }
 
 pub struct Supervisor {
-    supervisees: Mutex<HashMap<u32, Supervisee>>,
+    supervisees: Mutex<HashMap<u32, Arc<Mutex<Supervisee>>>>,
     pool: PgPool,
 
-    wbi_keys: (String, String),
-    buvid: String,
+    cli: Arc<ApiClient>,
 
     room_key_cache: Arc<msg::RoomKeyCache>,
-    api_rl: Arc<RateLimiter>,
-    msg_rl: Arc<RateLimiter>,
 
     // returns the room_id along with the task's result.
     room_watch_join_set: Mutex<JoinSet<(u32, Result<()>)>>,
@@ -46,17 +41,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(pool: PgPool, wbi_keys: (String, String), buvid: String) -> Self {
+    pub fn new(pool: PgPool, cli: Arc<ApiClient>) -> Self {
         let instance_id = uuid::Uuid::new_v4().to_string();
         let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
         Self {
             supervisees: Mutex::new(HashMap::new()),
             pool,
-            wbi_keys,
-            buvid,
+            cli,
             room_key_cache,
-            api_rl: Arc::new(RateLimiter::default()),
-            msg_rl: Arc::new(RateLimiter::default()),
             room_watch_join_set: Mutex::new(JoinSet::new()),
             handlers_join_set: Mutex::new(JoinSet::new()),
         }
@@ -66,48 +58,47 @@ impl Supervisor {
         loop {
             // Wait for any of the supervised tasks to complete.
             let res = self.room_watch_join_set.lock().await.join_next().await;
-            if let Some(res) = res {
-                match res {
-                    Ok((room_id, task_result)) => {
-                        // This should exist
-                        let message_tx = self
-                            .supervisees
-                            .lock()
-                            .await
-                            .get(&room_id)
-                            .unwrap()
-                            .message_tx
-                            .clone();
-                        match task_result {
-                            Ok(()) => {
-                                // Task completed gracefully.
-                                info!(
-                                    room_id;
-                                    "Room watch for room {} exited gracefully. Restarting...",
-                                    room_id
-                                );
-                                // restart?
-                                time::sleep(Duration::from_secs(5)).await;
-                                self.restart_room_watch(room_id, message_tx).await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    room_id;
-                                    "Room watch for room {} failed: {:#}. Restarting...",
-                                    room_id,
-                                    e
-                                );
-                                time::sleep(Duration::from_secs(5)).await;
-                                self.restart_room_watch(room_id, message_tx).await;
-                            }
+            match res {
+                Some(Ok((room_id, task_result))) => {
+                    // This should exist
+                    let message_tx = self
+                        .supervisees
+                        .lock()
+                        .await
+                        .get(&room_id)
+                        .unwrap()
+                        .lock()
+                        .await
+                        .message_tx
+                        .clone();
+                    match task_result {
+                        Ok(()) => {
+                            // Task completed gracefully.
+                            info!(
+                                room_id;
+                                "Room watch for room {} exited gracefully. Restarting...",
+                                room_id
+                            );
+                            // restart?
+                            time::sleep(Duration::from_secs(5)).await;
+                            self.restart_room_watch(room_id, message_tx).await;
+                        }
+                        Err(e) => {
+                            error!(
+                                room_id;
+                                "Room watch for room {} failed: {:#}. Restarting...",
+                                room_id,
+                                e
+                            );
+                            time::sleep(Duration::from_secs(5)).await;
+                            self.restart_room_watch(room_id, message_tx).await;
                         }
                     }
-                    Err(e) => {
-                        error!("A supervised task panicked or was cancelled: {:#}", e);
-                    }
                 }
-            } else if self.room_watch_join_set.lock().await.is_empty() {
-                time::sleep(Duration::from_secs(1)).await;
+                Some(Err(e)) => {
+                    error!("A supervised task panicked or was cancelled: {:#}", e);
+                }
+                None => time::sleep(Duration::from_secs(1)).await,
             }
         }
     }
@@ -136,7 +127,8 @@ impl Supervisor {
             // message_rx,
             concile_handle: None,
         };
-        supervisees.insert(room_id, supervisee);
+        let ee = Arc::new(Mutex::new(supervisee));
+        supervisees.insert(room_id, ee.clone());
 
         drop(supervisees);
 
@@ -164,9 +156,9 @@ impl Supervisor {
         info!(room_id; "Adding and starting watch for room {}.", room_id);
         self.start_room_watch(room_id, message_tx).await?;
 
-        // TODO: use a global concile task instead of per-room
-        let mut supervisees = self.supervisees.lock().await;
-        let ee = supervisees.get_mut(&room_id).unwrap();
+        let mut ee = ee.lock().await;
+
+        let live_status = ee.live_status.clone();
         ee.connection_ready.store(true, Ordering::SeqCst);
         ee.concile_handle = Some(tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(600));
@@ -190,12 +182,9 @@ impl Supervisor {
     ) -> Result<()> {
         let mut room_watch = RoomWatch::new(
             room_id,
-            self.wbi_keys.clone(),
-            self.buvid.clone(),
+            self.cli.clone(),
             message_tx,
             self.room_key_cache.clone(),
-            self.api_rl.clone(),
-            self.msg_rl.clone(),
         );
 
         let task = room_watch.start().await?;
@@ -216,12 +205,9 @@ impl Supervisor {
     ) {
         let mut room_watch = RoomWatch::new(
             room_id,
-            self.wbi_keys.clone(),
-            self.buvid.clone(),
+            self.cli.clone(),
             message_tx,
             self.room_key_cache.clone(),
-            self.api_rl.clone(),
-            self.msg_rl.clone(),
         );
         self.room_watch_join_set.lock().await.spawn(async move {
             match room_watch.start().await {

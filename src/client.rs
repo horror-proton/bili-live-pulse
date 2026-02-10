@@ -2,8 +2,11 @@ use super::model;
 use super::utils::backoff;
 use super::utils::backoff::RateLimiter;
 use super::wbi;
+use crate::token_bucket::TokenBucket;
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
@@ -17,7 +20,7 @@ struct DanmuInfoResultData {
     token: String,
 }
 
-pub async fn fetch_room_key(
+async fn fetch_room_key(
     rate_limiter: &RateLimiter,
     room_id: u32,
     wbi_keys: Option<(String, String)>,
@@ -118,7 +121,49 @@ pub async fn fetch_live_status(room_id: u32) -> Result<model::RoomInfo> {
     ))
 }
 
-pub async fn fetch_buvidv3() -> Result<String> {
+pub struct ApiClient {
+    cli: reqwest::Client,
+    wbi_keys: (String, String), // TDDO: update periodicly
+    buvid_cache: Mutex<Vec<String>>,
+    buvid_tb: Arc<TokenBucket>,
+    rate_limiter: RateLimiter,
+}
+
+impl ApiClient {
+    pub fn new(wbi_keys: (String, String)) -> Self {
+        Self {
+            cli: reqwest::Client::new(),
+            wbi_keys,
+            buvid_cache: Mutex::new(Vec::new()),
+            buvid_tb: TokenBucket::new(1, 1),
+            rate_limiter: RateLimiter::default(),
+        }
+    }
+
+    pub async fn get_buvidv3(&self) -> Result<String> {
+        if self.buvid_tb.try_consume_one() {
+            let buvid = fetch_buvidv3().await?;
+            let mut cache = self.buvid_cache.lock().await;
+            cache.push(buvid.clone());
+            Ok(buvid)
+        } else {
+            if let Some(buvid) = self.buvid_cache.lock().await.last().cloned() {
+                Ok(buvid)
+            } else {
+                self.buvid_tb.consume_one().await;
+                let buvid = fetch_buvidv3().await?;
+                self.buvid_cache.lock().await.push(buvid.clone());
+                Ok(buvid)
+            }
+        }
+    }
+
+    pub async fn get_room_key(&self, room_id: u32) -> Result<String> {
+        Ok(fetch_room_key(&self.rate_limiter, room_id, Some(self.wbi_keys.clone())).await?)
+    }
+}
+
+async fn fetch_buvidv3() -> Result<String> {
     #[derive(serde::Deserialize)]
     struct RespData {
         b_3: String,

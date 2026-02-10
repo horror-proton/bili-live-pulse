@@ -2,9 +2,11 @@ use anyhow;
 use anyhow::Result;
 use log::{debug, error, info, trace, warn};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::client::ApiClient;
 use crate::{msg::LiveMessage, utils};
 
 use crate::msg;
@@ -52,17 +54,18 @@ impl Drop for ConnectionReplica {
     }
 }
 
-type ErrorType = utils::backoff::RetryOrError<Option<msg::MsgConnection>, anyhow::Error>;
+type ErrorType =
+    utils::backoff::RetryOrError<(Option<msg::MsgConnection>, Arc<ApiClient>), anyhow::Error>;
 
 pub async fn ensure_connection(
     rl: &utils::backoff::RateLimiter,
     room_id: u32,
     key: &msg::RoomKeyLease,
-    buvid: &str,
+    cli: Arc<ApiClient>,
     existing: Option<msg::MsgConnection>,
 ) -> Result<msg::MsgConnection> {
-    rl.call_with_retry(existing, |existing| {
-        ensure_connection_impl(room_id, key, buvid, existing)
+    rl.call_with_retry((existing, cli), |(existing, cli)| {
+        ensure_connection_impl(room_id, key, cli, existing)
     })
     .await
 }
@@ -71,18 +74,26 @@ pub async fn ensure_connection(
 async fn ensure_connection_impl(
     room_id: u32,
     key: &msg::RoomKeyLease,
-    buvid: &str,
+    cli: Arc<ApiClient>,
     existing: Option<msg::MsgConnection>,
 ) -> std::result::Result<msg::MsgConnection, ErrorType> {
     {
+        let buvid = match cli.get_buvidv3().await {
+            Ok(buvid) => buvid,
+            Err(e) => {
+                warn!(room_id; "Failed to get buvid: {:?}", e);
+                return Err(ErrorType::Retry((existing, cli)));
+            }
+        };
+
         let lhs_c = match existing {
             Some(conn) => conn,
-            None => msg::MsgConnection::new(room_id, key.key(), buvid)
+            None => msg::MsgConnection::new(room_id, key.key(), &buvid)
                 .await
                 .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?,
         };
 
-        let rhs_c = msg::MsgConnection::new(room_id, key.key(), buvid)
+        let rhs_c = msg::MsgConnection::new(room_id, key.key(), &buvid)
             .await
             .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?;
 
@@ -116,15 +127,13 @@ async fn ensure_connection_impl(
         let (lhs_msgs, rhs_msgs) = cmp.dump();
         warn!(room_id; "Inconsistent connections detected: lhs={} ({}) rhs={} ({})", l, lhs_msgs.len(), r, rhs_msgs.len());
 
-        if l < r {
+        if lhs_msgs.len() >= rhs_msgs.len() {
             // lhs has more messages not in rhs, keep lhs
-            debug!(room_id; "Keeping LHS connection");
             let (conn, _) = lhs.join().await.map_err(|e| ErrorType::Error(e))?;
-            return Err(ErrorType::Retry(Some(conn)));
+            return Err(ErrorType::Retry((Some(conn), cli)));
         } else {
-            debug!(room_id; "Keeping RHS connection");
             let (conn, _) = rhs.join().await.map_err(|e| ErrorType::Error(e))?;
-            return Err(ErrorType::Retry(Some(conn)));
+            return Err(ErrorType::Retry((Some(conn), cli)));
         }
     }
 }
