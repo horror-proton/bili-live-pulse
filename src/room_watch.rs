@@ -101,20 +101,4 @@ impl RoomWatch {
         let task = tokio::spawn(async move { conn.start(cancel_token, message_tx, key).await });
         Ok(task)
     }
-
-    /*
-    pub async fn run<C, F, Fut>(&mut self, mut ctx: C, mut on_msg: F) -> Result<C>
-    where
-        F: FnMut(C, msg::LiveMessage) -> Fut,
-        Fut: std::future::Future<Output = Result<C>>,
-    {
-        loop {
-            match self.message_rx.recv().await {
-                Ok(m) => ctx = on_msg(ctx, m).await?,
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!("Missed {} messages", n),
-                Err(e) => Err(e)?,
-            }
-        }
-    }
-    */
 }

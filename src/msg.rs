@@ -361,7 +361,7 @@ impl MsgConnection {
         &mut self,
         cancel_token: CancellationToken,
         message_tx: broadcast::Sender<LiveMessage>,
-        key: RoomKeyLease,
+        _key: RoomKeyLease,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         loop {
@@ -384,7 +384,6 @@ impl MsgConnection {
                 },
 
                 _ = interval.tick() => {
-                    key.renew().await?;
                     let heartbeat_packet = LiveMessage::new_heartbeat().serialize();
                     if let Err(e) = self.write_stream
                         .send(protocol::Message::binary(heartbeat_packet))
