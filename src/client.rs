@@ -2,7 +2,7 @@ use super::model;
 use super::utils::backoff;
 use super::utils::backoff::RateLimiter;
 use super::wbi;
-use crate::token_bucket::TokenBucket;
+use crate::{msg, token_bucket::TokenBucket};
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
 use std::sync::Arc;
@@ -124,16 +124,18 @@ pub async fn fetch_live_status(room_id: u32) -> Result<model::RoomInfo> {
 pub struct ApiClient {
     cli: reqwest::Client,
     wbi_keys: (String, String), // TDDO: update periodicly
+    room_key_cache: Arc<msg::RoomKeyCache>,
     buvid_cache: Mutex<Vec<String>>,
     buvid_tb: Arc<TokenBucket>,
     rate_limiter: RateLimiter,
 }
 
 impl ApiClient {
-    pub fn new(wbi_keys: (String, String)) -> Self {
+    pub fn new(wbi_keys: (String, String), room_key_cache: Arc<msg::RoomKeyCache>) -> Self {
         Self {
             cli: reqwest::Client::new(),
             wbi_keys,
+            room_key_cache,
             buvid_cache: Mutex::new(Vec::new()),
             buvid_tb: TokenBucket::new(1, 1),
             rate_limiter: RateLimiter::default(),
@@ -158,8 +160,18 @@ impl ApiClient {
         }
     }
 
-    pub async fn get_room_key(&self, room_id: u32) -> Result<String> {
-        Ok(fetch_room_key(&self.rate_limiter, room_id, Some(self.wbi_keys.clone())).await?)
+    pub async fn get_room_key(&self, room_id: u32) -> Result<msg::RoomKeyLease> {
+        match self.room_key_cache.try_get(room_id as i32).await? {
+            Some(key) => Ok(key),
+            None => {
+                let new_key = fetch_room_key(&self.rate_limiter, room_id, None).await?;
+                let lease = self
+                    .room_key_cache
+                    .insert_and_get(room_id as i32, &new_key)
+                    .await?;
+                Ok(lease)
+            }
+        }
     }
 }
 

@@ -91,7 +91,10 @@ async fn main() -> Result<()> {
 
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
-    let cli = Arc::new(client::ApiClient::new(wbi_keys.clone()));
+
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
+    let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
 
     use supervisor::Supervisor;
 

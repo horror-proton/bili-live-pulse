@@ -15,10 +15,8 @@ use backoff::RateLimiter;
 pub struct RoomWatch {
     pub room_id: u32,
     cli: Arc<ApiClient>,
-    key: Option<msg::RoomKeyLease>,
     cancel_token: CancellationToken,
 
-    room_key_cache: Arc<msg::RoomKeyCache>,
     msg_rl: Arc<RateLimiter>, // TODO: move to cli
 
     // consumer: Option<JoinHandle<Result<()>>>,
@@ -31,13 +29,10 @@ impl RoomWatch {
         room_id: u32,
         cli: Arc<ApiClient>,
         message_tx: broadcast::Sender<msg::LiveMessage>,
-        room_key_cache: Arc<msg::RoomKeyCache>,
     ) -> Self {
         Self {
             room_id,
             cli,
-            key: None,
-            room_key_cache,
             cancel_token: CancellationToken::new(),
             msg_rl: Arc::new(RateLimiter::default()),
             // consumer: None,
@@ -47,35 +42,24 @@ impl RoomWatch {
     }
 
     async fn get_new_key(&self) -> Result<msg::RoomKeyLease> {
-        match self.room_key_cache.try_get(self.room_id as i32).await? {
-            Some(key) => Ok(key),
-            None => {
-                let new_key = self.cli.get_room_key(self.room_id).await?;
-                let lease = self
-                    .room_key_cache
-                    .insert_and_get(self.room_id as i32, &new_key)
-                    .await?;
-                Ok(lease)
-            }
-        }
+        Ok(self.cli.get_room_key(self.room_id).await?)
     }
 
     pub async fn start(&mut self) -> Result<JoinHandle<Result<()>>> {
-        let mut key = match self.key.take() {
-            Some(k) => k,
-            None => self.get_new_key().await?,
-        };
+        let key = self.get_new_key().await?;
+        let mut key = Arc::new(key);
 
         let room_id = self.room_id;
 
         let conn = loop {
+            // TODO: move into new()
             let buvid = self.cli.get_buvidv3().await?;
-            let conn = match msg::MsgConnection::new(room_id, key.key(), &buvid).await {
+            let conn = match msg::MsgConnection::new(room_id, key.clone(), &buvid).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
                     warn!(room_id; "Auth error renewing key {:?}", key);
                     key.invalidate().await?;
-                    key = self.get_new_key().await?;
+                    key = Arc::new(self.get_new_key().await?);
                     continue;
                 }
                 Err(msg::MsgError::AnyhowError(a)) => {
@@ -85,20 +69,17 @@ impl RoomWatch {
             break conn;
         };
 
-        info!(room_id; "Using key {}", key.key());
-
         // there's as small chance that we get a nasty connection that returns less events
         use channel_consistency::ensure_connection;
         let mut conn =
-            ensure_connection(&self.msg_rl, room_id, &key, self.cli.clone(), Some(conn)).await?;
+            ensure_connection(&self.msg_rl, room_id, self.cli.clone(), Some(conn)).await?;
 
         info!(room_id; "WebSocket connection established");
 
         let cancel_token = self.cancel_token.clone();
         let message_tx = self.message_tx.clone();
-        let key = key.clone();
 
-        let task = tokio::spawn(async move { conn.start(cancel_token, message_tx, key).await });
+        let task = tokio::spawn(async move { conn.start(cancel_token, message_tx).await });
         Ok(task)
     }
 }

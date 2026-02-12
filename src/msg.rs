@@ -226,6 +226,7 @@ fn build_packet(message: Vec<u8>, operation: u32, sequence: u32) -> Vec<u8> {
 }
 
 pub struct MsgConnection {
+    key: Arc<RoomKeyLease>,
     read_stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     write_stream: futures_util::stream::SplitSink<
         WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -257,7 +258,11 @@ impl From<MsgError> for anyhow::Error {
 }
 
 impl MsgConnection {
-    pub async fn new(roomid: u32, key: &str, buvid: &str) -> std::result::Result<Self, MsgError> {
+    pub async fn new(
+        roomid: u32,
+        key: Arc<RoomKeyLease>,
+        buvid: &str,
+    ) -> std::result::Result<Self, MsgError> {
         use reqwest::header::*;
 
         let url = "wss://broadcastlv.chat.bilibili.com:443/sub";
@@ -285,7 +290,7 @@ impl MsgConnection {
 
         let (mut write, mut read_stream) = ws_stream.split();
 
-        let auth_msg = LiveMessage::new_auth(roomid, key, buvid).serialize();
+        let auth_msg = LiveMessage::new_auth(roomid, key.key(), buvid).serialize();
         write
             .send(protocol::Message::binary(auth_msg))
             .await
@@ -317,6 +322,7 @@ impl MsgConnection {
         let heartbeat_pending = Arc::new(AtomicBool::new(false));
 
         Ok(MsgConnection {
+            key,
             read_stream,
             write_stream: write,
             sequence: AtomicU32::new(1),
@@ -361,7 +367,6 @@ impl MsgConnection {
         &mut self,
         cancel_token: CancellationToken,
         message_tx: broadcast::Sender<LiveMessage>,
-        _key: RoomKeyLease,
     ) -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         loop {

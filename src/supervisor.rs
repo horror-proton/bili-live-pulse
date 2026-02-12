@@ -32,8 +32,6 @@ pub struct Supervisor {
 
     cli: Arc<ApiClient>,
 
-    room_key_cache: Arc<msg::RoomKeyCache>,
-
     // returns the room_id along with the task's result.
     room_watch_join_set: Mutex<JoinSet<(u32, Result<()>)>>,
 
@@ -42,13 +40,10 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new(pool: PgPool, cli: Arc<ApiClient>) -> Self {
-        let instance_id = uuid::Uuid::new_v4().to_string();
-        let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
         Self {
             supervisees: Mutex::new(HashMap::new()),
             pool,
             cli,
-            room_key_cache,
             room_watch_join_set: Mutex::new(JoinSet::new()),
             handlers_join_set: Mutex::new(JoinSet::new()),
         }
@@ -180,12 +175,7 @@ impl Supervisor {
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
     ) -> Result<()> {
-        let mut room_watch = RoomWatch::new(
-            room_id,
-            self.cli.clone(),
-            message_tx,
-            self.room_key_cache.clone(),
-        );
+        let mut room_watch = RoomWatch::new(room_id, self.cli.clone(), message_tx);
 
         let task = room_watch.start().await?;
 
@@ -203,12 +193,7 @@ impl Supervisor {
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
     ) {
-        let mut room_watch = RoomWatch::new(
-            room_id,
-            self.cli.clone(),
-            message_tx,
-            self.room_key_cache.clone(),
-        );
+        let mut room_watch = RoomWatch::new(room_id, self.cli.clone(), message_tx);
         self.room_watch_join_set.lock().await.spawn(async move {
             match room_watch.start().await {
                 Ok(task) => match task.await {

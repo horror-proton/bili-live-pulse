@@ -19,13 +19,12 @@ struct ConnectionReplica {
 impl ConnectionReplica {
     pub async fn new(
         mut connection: msg::MsgConnection,
-        key: msg::RoomKeyLease,
         message_tx: broadcast::Sender<LiveMessage>,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let ct_clone = cancel_token.clone();
         let handle = tokio::spawn(async move {
-            let res = connection.start(ct_clone, message_tx, key).await;
+            let res = connection.start(ct_clone, message_tx).await;
             (connection, res)
         });
 
@@ -60,20 +59,31 @@ type ErrorType =
 pub async fn ensure_connection(
     rl: &utils::backoff::RateLimiter,
     room_id: u32,
-    key: &msg::RoomKeyLease,
     cli: Arc<ApiClient>,
     existing: Option<msg::MsgConnection>,
 ) -> Result<msg::MsgConnection> {
+    /*
     rl.call_with_retry((existing, cli), |(existing, cli)| {
         ensure_connection_impl(room_id, key, cli, existing)
     })
     .await
+    */
+    let mut existing = existing;
+    loop {
+        match ensure_connection_impl(room_id, cli.clone(), existing).await {
+            Ok(conn) => return Ok(conn),
+            Err(ErrorType::Retry((e, cli))) => {
+                existing = e;
+                continue;
+            }
+            Err(ErrorType::Error(e)) => return Err(e),
+        }
+    }
 }
 
 // TODO: which to return, connection or channel?
 async fn ensure_connection_impl(
     room_id: u32,
-    key: &msg::RoomKeyLease,
     cli: Arc<ApiClient>,
     existing: Option<msg::MsgConnection>,
 ) -> std::result::Result<msg::MsgConnection, ErrorType> {
@@ -88,20 +98,30 @@ async fn ensure_connection_impl(
 
         let lhs_c = match existing {
             Some(conn) => conn,
-            None => msg::MsgConnection::new(room_id, key.key(), &buvid)
-                .await
-                .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?,
+            None => {
+                let lhs_k = cli
+                    .get_room_key(room_id)
+                    .await
+                    .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?;
+                msg::MsgConnection::new(room_id, Arc::new(lhs_k), &buvid)
+                    .await
+                    .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?
+            }
         };
 
-        let rhs_c = msg::MsgConnection::new(room_id, key.key(), &buvid)
+        let rhs_k = cli
+            .get_room_key(room_id)
+            .await
+            .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?;
+        let rhs_c = msg::MsgConnection::new(room_id, Arc::new(rhs_k), &buvid)
             .await
             .map_err(|e| ErrorType::Error(anyhow::Error::from(e)))?;
 
         let (lhs_tx, lhs_rx) = broadcast::channel::<LiveMessage>(1);
         let (rhs_tx, rhs_rx) = broadcast::channel::<LiveMessage>(1);
 
-        let mut lhs = ConnectionReplica::new(lhs_c, key.clone(), lhs_tx).await;
-        let mut rhs = ConnectionReplica::new(rhs_c, key.clone(), rhs_tx).await;
+        let mut lhs = ConnectionReplica::new(lhs_c, lhs_tx).await;
+        let mut rhs = ConnectionReplica::new(rhs_c, rhs_tx).await;
 
         info!(room_id; "Comparing connections");
         let mut cmp = Comparator2::new(lhs_rx, rhs_rx).with_filter(|m: &LiveMessage| match m {
