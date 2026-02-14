@@ -58,10 +58,12 @@ async fn main() -> Result<()> {
                 let (stream, _) = listener.accept().await.unwrap();
                 {
                     let io = hyper_util::rt::TokioIo::new(stream);
-                    hyper::server::conn::http1::Builder::new()
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, hyper::service::service_fn(srv_fn))
                         .await
-                        .unwrap();
+                    {
+                        warn!("Error serving connection: {}", e);
+                    }
                 }
             }
         });

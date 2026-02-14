@@ -86,7 +86,6 @@ impl RoomKeyCache {
                 .await
                 .map_err(|e| {
                     warn!("Failed to renew leases: {:?}", e);
-                    panic!("Failed to renew leases: {:?}", e);
                 });
             }
         });
