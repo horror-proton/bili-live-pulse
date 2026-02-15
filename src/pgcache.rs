@@ -72,8 +72,10 @@ impl RoomKeyCache {
         let pool_clone = pool.clone();
 
         let renew_handler = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                interval.tick().await;
 
                 let reg = registry_clone.lock().await;
                 let record_ids: Vec<i32> = reg.keys().cloned().collect();

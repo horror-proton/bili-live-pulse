@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
     let sem = Arc::new(Semaphore::new(attempt_n));
     let mut set = tokio::task::JoinSet::new();
 
+    let run_handle = sup.run();
     for room_id in room_ids {
         let sup = sup.clone();
         let live_status = Arc::new(live_status::LiveStatus::new(room_id, pool.clone()));
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
     }
     info!("All RoomWatch initialized");
     READY.store(true, Ordering::SeqCst);
-    sup.run().await?;
+    run_handle.await?;
 
     Ok(())
 }

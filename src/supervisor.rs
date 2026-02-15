@@ -2,6 +2,7 @@ use anyhow::Result;
 use log::{debug, error, info, trace, warn};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -22,12 +23,10 @@ struct Supervisee {
     live_status: Arc<LiveStatus>,
     connection_ready: Arc<AtomicBool>,
     message_tx: broadcast::Sender<msg::LiveMessage>,
-    // message_rx: broadcast::Receiver<msg::LiveMessage>,
-    concile_handle: Option<JoinHandle<()>>,
 }
 
 pub struct Supervisor {
-    supervisees: Mutex<HashMap<u32, Arc<Mutex<Supervisee>>>>,
+    supervisees: Mutex<(HashMap<u32, Arc<Supervisee>>, VecDeque<u32>)>,
     pool: PgPool,
 
     cli: Arc<ApiClient>,
@@ -41,7 +40,7 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(pool: PgPool, cli: Arc<ApiClient>) -> Self {
         Self {
-            supervisees: Mutex::new(HashMap::new()),
+            supervisees: Mutex::new((HashMap::new(), VecDeque::new())),
             pool,
             cli,
             room_watch_join_set: Mutex::new(JoinSet::new()),
@@ -50,51 +49,19 @@ impl Supervisor {
     }
 
     pub async fn run(&self) -> Result<()> {
+        let mut interval = time::interval(Duration::from_secs(5));
+
         loop {
-            // Wait for any of the supervised tasks to complete.
-            let res = self.room_watch_join_set.lock().await.join_next().await;
-            match res {
-                Some(Ok((room_id, task_result))) => {
-                    // This should exist
-                    let message_tx = self
-                        .supervisees
-                        .lock()
-                        .await
-                        .get(&room_id)
-                        .unwrap()
-                        .lock()
-                        .await
-                        .message_tx
-                        .clone();
-                    match task_result {
-                        Ok(()) => {
-                            // Task completed gracefully.
-                            info!(
-                                room_id;
-                                "Room watch for room {} exited gracefully. Restarting...",
-                                room_id
-                            );
-                            // restart?
-                            time::sleep(Duration::from_secs(5)).await;
-                            self.restart_room_watch(room_id, message_tx).await;
-                        }
-                        Err(e) => {
-                            error!(
-                                room_id;
-                                "Room watch for room {} failed: {:#}. Restarting...",
-                                room_id,
-                                e
-                            );
-                            time::sleep(Duration::from_secs(5)).await;
-                            self.restart_room_watch(room_id, message_tx).await;
-                        }
-                    }
+            interval.tick().await;
+
+            if let Ok(mut lk) = self.room_watch_join_set.try_lock() {
+                if let Some(res) = lk.try_join_next() {
+                    drop(lk);
+                    self.handle_room_watch_failure(res).await;
                 }
-                Some(Err(e)) => {
-                    error!("A supervised task panicked or was cancelled: {:#}", e);
-                }
-                None => time::sleep(Duration::from_secs(1)).await,
             }
+
+            self.handle_room_concilation().await;
         }
     }
 
@@ -107,7 +74,7 @@ impl Supervisor {
         info!(room_id; "Adding room {} to supervision.", room_id);
 
         let mut supervisees = self.supervisees.lock().await;
-        if supervisees.contains_key(&room_id) {
+        if supervisees.0.contains_key(&room_id) {
             warn!(room_id; "Room {} is already being supervised.", room_id);
             return Ok(());
         }
@@ -119,11 +86,14 @@ impl Supervisor {
             live_status: live_status.clone(),
             connection_ready: connection_ready.clone(),
             message_tx: message_tx.clone(),
-            // message_rx,
-            concile_handle: None,
         };
-        let ee = Arc::new(Mutex::new(supervisee));
-        supervisees.insert(room_id, ee.clone());
+        let ee = Arc::new(supervisee);
+        if supervisees.0.contains_key(&room_id) {
+            warn!(room_id; "Room {} is already being supervised, skipping", room_id);
+            return Ok(());
+        }
+        let ee = supervisees.0.entry(room_id).or_insert(ee).clone();
+        supervisees.1.push_back(room_id);
 
         drop(supervisees);
 
@@ -151,20 +121,11 @@ impl Supervisor {
         info!(room_id; "Adding and starting watch for room {}.", room_id);
         self.start_room_watch(room_id, message_tx).await?;
 
-        let mut ee = ee.lock().await;
-
-        let live_status = ee.live_status.clone();
         ee.connection_ready.store(true, Ordering::SeqCst);
-        ee.concile_handle = Some(tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(600));
-            loop {
-                interval.tick().await;
-                match live_status.concile_status().await {
-                    Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
-                    Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
-                }
-            }
-        }));
+        match ee.live_status.concile_status().await {
+            Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
+            Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+        }
 
         Ok(())
     }
@@ -203,5 +164,68 @@ impl Supervisor {
                 Err(e) => (room_id, Err(e)),
             }
         });
+    }
+
+    async fn handle_room_watch_failure(
+        &self,
+        res: Result<(u32, Result<()>), tokio::task::JoinError>,
+    ) {
+        match res {
+            Ok((room_id, task_result)) => {
+                let message_tx = self
+                    .supervisees
+                    .lock()
+                    .await
+                    .0
+                    .get(&room_id)
+                    .unwrap()
+                    .message_tx
+                    .clone();
+                match task_result {
+                    Ok(()) => {
+                        // Task completed gracefully.
+                        info!(
+                            room_id;
+                            "Room watch for room {} exited gracefully. Restarting...",
+                            room_id
+                        );
+                        // restart?
+                        time::sleep(Duration::from_secs(5)).await;
+                        self.restart_room_watch(room_id, message_tx).await;
+                    }
+                    Err(e) => {
+                        error!(
+                            room_id;
+                            "Room watch for room {} failed: {:#}. Restarting...",
+                            room_id,
+                            e
+                        );
+                        time::sleep(Duration::from_secs(5)).await;
+                        self.restart_room_watch(room_id, message_tx).await;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("A supervised task panicked or was cancelled: {:#}", e);
+            }
+        }
+    }
+
+    async fn handle_room_concilation(&self) {
+        let mut supervisees = self.supervisees.lock().await;
+        let Some(room_id) = supervisees.1.pop_front() else {
+            return;
+        };
+        if let Some(supervisee) = supervisees.0.get(&room_id) {
+            // TODO: unlock supervisees before awaiting
+            match supervisee.live_status.concile_status().await {
+                Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
+                Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+            }
+        } else {
+            return;
+        }
+
+        supervisees.1.push_back(room_id);
     }
 }
