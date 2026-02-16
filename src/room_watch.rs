@@ -46,20 +46,17 @@ impl RoomWatch {
     }
 
     pub async fn start(&mut self) -> Result<JoinHandle<Result<()>>> {
-        let key = self.get_new_key().await?;
-        let mut key = Arc::new(key);
-
         let room_id = self.room_id;
 
         let conn = loop {
             // TODO: move into new()
+            let key = Arc::new(self.get_new_key().await?);
             let buvid = self.cli.get_buvidv3().await?;
             let conn = match msg::MsgConnection::new(room_id, key.clone(), &buvid).await {
                 Ok(c) => c,
                 Err(msg::MsgError::AuthError) => {
                     warn!(room_id; "Auth error renewing key {:?}", key);
                     key.invalidate().await?;
-                    key = Arc::new(self.get_new_key().await?);
                     continue;
                 }
                 Err(msg::MsgError::AnyhowError(a)) => {

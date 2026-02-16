@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
     let instance_id = uuid::Uuid::new_v4().to_string();
+    info!("Instance ID: {}", instance_id);
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
     let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
 
@@ -118,6 +119,8 @@ async fn main() -> Result<()> {
             let _permit = sem.acquire().await.unwrap();
             sup.add_room_blocking(room_id, live_status).await
         });
+        // TODO: use token bucket in cli
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 
     while let Some(res) = set.join_next().await {

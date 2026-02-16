@@ -239,12 +239,12 @@ where
         loop {
             tokio::select! {
                 _ = self.lhs.recv() => {
-                    if self.lhs.buffer.len() >= max_length && self.rhs.buffer.len() >= max_length {
+                    if self.lhs.buffer.len() >= max_length && self.rhs.buffer.len() != max_length - 1 {
                         break;
                     }
                 }
                 _ = self.rhs.recv() => {
-                    if self.lhs.buffer.len() >= max_length && self.rhs.buffer.len() >= max_length {
+                    if self.rhs.buffer.len() >= max_length && self.lhs.buffer.len() != max_length - 1 {
                         break;
                     }
                 }
