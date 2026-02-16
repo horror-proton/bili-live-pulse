@@ -54,11 +54,8 @@ impl Supervisor {
         loop {
             interval.tick().await;
 
-            if let Ok(mut lk) = self.room_watch_join_set.try_lock() {
-                if let Some(res) = lk.try_join_next() {
-                    drop(lk);
-                    self.handle_room_watch_failure(res).await;
-                }
+            if let Some(res) = self.room_watch_join_set.lock().await.try_join_next() {
+                self.handle_room_watch_failure(res).await;
             }
 
             self.handle_room_concilation().await;
@@ -88,10 +85,6 @@ impl Supervisor {
             message_tx: message_tx.clone(),
         };
         let ee = Arc::new(supervisee);
-        if supervisees.0.contains_key(&room_id) {
-            warn!(room_id; "Room {} is already being supervised, skipping", room_id);
-            return Ok(());
-        }
         let ee = supervisees.0.entry(room_id).or_insert(ee).clone();
         supervisees.1.push_back(room_id);
 
@@ -212,20 +205,26 @@ impl Supervisor {
     }
 
     async fn handle_room_concilation(&self) {
-        let mut supervisees = self.supervisees.lock().await;
-        let Some(room_id) = supervisees.1.pop_front() else {
-            return;
+        let (room_id, live_status) = {
+            let mut supervisees = self.supervisees.lock().await;
+            let room_id = match supervisees.1.pop_front() {
+                Some(id) => id,
+                None => return,
+            };
+
+            let live_status = match supervisees.0.get(&room_id) {
+                Some(s) => s.live_status.clone(),
+                None => return,
+            };
+
+            (room_id, live_status)
         };
-        if let Some(supervisee) = supervisees.0.get(&room_id) {
-            // TODO: unlock supervisees before awaiting
-            match supervisee.live_status.concile_status().await {
-                Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
-                Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
-            }
-        } else {
-            return;
+
+        match live_status.concile_status().await {
+            Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
+            Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
         }
 
-        supervisees.1.push_back(room_id);
+        self.supervisees.lock().await.1.push_back(room_id);
     }
 }

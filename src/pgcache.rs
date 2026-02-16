@@ -114,6 +114,7 @@ impl RoomKeyCache {
                 AND (lease_until IS NULL OR lease_until < NOW())
                 AND expired = FALSE
                 LIMIT 1
+                FOR UPDATE SKIP LOCKED
             )
             RETURNING id, room_key
             "#,

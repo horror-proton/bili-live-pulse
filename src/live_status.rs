@@ -201,8 +201,18 @@ async fn store_live_status_to_db(
     // ON CONFLICT (room_id) DO UPDATE SET time = NOW(), status = EXCLUDED.status
     sqlx::query!(
         r#"
+        WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('live_status'), $1) AS got)
         INSERT INTO live_status (time, room_id, status)
-        VALUES (NOW(), $1, $2)
+        SELECT NOW(), $1, $2
+        WHERE (SELECT got FROM lock)
+        AND NOT COALESCE((
+            SELECT status = $2
+            FROM live_status
+            WHERE room_id = $1
+            AND time > NOW() - INTERVAL '60 minutes'
+            ORDER BY time DESC
+            LIMIT 1
+        ), FALSE)
         "#,
         room_id as i32,
         status as i16
