@@ -149,7 +149,7 @@ impl ApiClient {
             cache.push(buvid.clone());
             Ok(buvid)
         } else {
-            if let Some(buvid) = self.buvid_cache.lock().await.last().cloned() {
+            if let Some(buvid) = { self.buvid_cache.lock().await.last().cloned() } {
                 Ok(buvid)
             } else {
                 self.buvid_tb.consume_one().await;

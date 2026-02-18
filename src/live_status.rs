@@ -81,7 +81,8 @@ impl LiveStatus {
                     store_live_status_to_db(pool, room_id, 0).await?; // TODO: 0 or 2?
 
                     let record = model::LiveMetaEnd::from_msg(room_id, m)?;
-                    if let Some(live_id_str) = &*self.live_id_str.lock().await {
+                    let mg = self.live_id_str.lock().await;
+                    if let Some(live_id_str) = &*mg {
                         record.store_end_time_est(live_id_str).execute(pool).await?;
                     } else {
                         model::store_live_meta_end_time(room_id as i32, None)

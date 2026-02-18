@@ -54,7 +54,8 @@ impl Supervisor {
         loop {
             interval.tick().await;
 
-            if let Some(res) = self.room_watch_join_set.lock().await.try_join_next() {
+            let res = self.room_watch_join_set.lock().await.try_join_next();
+            if let Some(res) = res {
                 self.handle_room_watch_failure(res).await;
             }
 
