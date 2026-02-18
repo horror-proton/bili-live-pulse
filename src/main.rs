@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
 
+use axum::http::StatusCode;
 use sqlx::postgres::PgPoolOptions;
 
 mod client;
@@ -20,56 +21,9 @@ use log::{debug, error, info, trace, warn};
 
 static READY: AtomicBool = AtomicBool::new(false);
 
-use http_body_util::Full;
-
-async fn srv_fn(
-    req: hyper::Request<hyper::body::Incoming>,
-) -> hyper::Result<hyper::Response<Full<hyper::body::Bytes>>> {
-    use hyper::Method;
-    use hyper::Response;
-    use hyper::body::Bytes;
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/healthz") => Ok(Response::new(Full::new(Bytes::from("Ok\r\n")))),
-        (&Method::GET, "/readyz") => {
-            if READY.load(Ordering::SeqCst) {
-                Ok(Response::new(Full::new(Bytes::from("Ok\r\n"))))
-            } else {
-                Ok(Response::builder()
-                    .status(503)
-                    .body(Full::new(Bytes::from("Not Ready\r\n")))
-                    .unwrap())
-            }
-        }
-        _ => Ok(Response::builder()
-            .status(404)
-            .body(Full::new(Bytes::from("Not Found\r\n")))
-            .unwrap()),
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8080));
-    if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                {
-                    let io = hyper_util::rt::TokioIo::new(stream);
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, hyper::service::service_fn(srv_fn))
-                        .await
-                    {
-                        warn!("Error serving connection: {}", e);
-                    }
-                }
-            }
-        });
-    } else {
-        warn!("Failed to bind to address {}", addr);
-    }
 
     let dml =
         std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
@@ -98,6 +52,32 @@ async fn main() -> Result<()> {
     info!("Instance ID: {}", instance_id);
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
     let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
+    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone()));
+
+    let app = axum::Router::new()
+        .route("/healthz", axum::routing::get(|| async { "Ok\r\n" }))
+        .route(
+            "/readyz",
+            axum::routing::get(|| async {
+                if READY.load(Ordering::SeqCst) {
+                    (StatusCode::OK, "Ok\r\n")
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, "Not Ready\r\n")
+                }
+            }),
+        )
+        .with_state(sup.clone());
+
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8080));
+    if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                warn!("Error serving: {}", e);
+            }
+        });
+    } else {
+        warn!("Failed to bind to address {}", addr);
+    }
 
     use supervisor::Supervisor;
 
@@ -106,7 +86,6 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(5);
 
-    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone()));
     let sem = Arc::new(Semaphore::new(attempt_n));
     let mut set = tokio::task::JoinSet::new();
 
