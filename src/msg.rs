@@ -286,7 +286,13 @@ impl MsgConnection {
             .body(())
             .unwrap();
 
-        let (ws_stream, _) = connect_async(req).await.context("Failed to connect")?;
+        info!(room_id=roomid; "using key {}", key.key());
+
+        let mut config = protocol::WebSocketConfig::default();
+        config.write_buffer_size = 512;
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(req, Some(config), false)
+            .await
+            .context("Failed to connect")?;
 
         let (mut write, mut read_stream) = ws_stream.split();
 
