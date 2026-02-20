@@ -6,6 +6,7 @@ use tokio::sync::Semaphore;
 use axum::http::StatusCode;
 use sqlx::postgres::PgPoolOptions;
 
+mod api;
 mod client;
 mod live_status;
 mod model;
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
                 }
             }),
         )
+        .route("/api/rooms", axum::routing::get(api::get_rooms))
         .with_state(sup.clone());
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8080));

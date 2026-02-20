@@ -19,10 +19,10 @@ use crate::room_watch;
 
 use room_watch::RoomWatch;
 
-struct Supervisee {
-    live_status: Arc<LiveStatus>,
-    connection_ready: Arc<AtomicBool>,
-    message_tx: broadcast::Sender<msg::LiveMessage>,
+pub struct Supervisee {
+    pub live_status: Arc<LiveStatus>,
+    pub connection_ready: Arc<AtomicBool>,
+    pub message_tx: broadcast::Sender<msg::LiveMessage>,
 }
 
 pub struct Supervisor {
@@ -61,6 +61,10 @@ impl Supervisor {
 
             self.handle_room_concilation().await;
         }
+    }
+
+    pub async fn supervisees(&self) -> HashMap<u32, Arc<Supervisee>> {
+        self.supervisees.lock().await.0.clone()
     }
 
     /// Adds a new room to be supervised.

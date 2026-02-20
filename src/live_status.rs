@@ -169,6 +169,10 @@ impl LiveStatus {
 
         Ok(())
     }
+
+    pub fn get_live_status(&self) -> i32 {
+        self.live_status.load(Ordering::SeqCst)
+    }
 }
 
 async fn store_danmaku_to_db(
