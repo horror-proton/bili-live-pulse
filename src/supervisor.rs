@@ -67,6 +67,10 @@ impl Supervisor {
         self.supervisees.lock().await.0.clone()
     }
 
+    pub async fn get_room(&self, room_id: u32) -> Option<Arc<Supervisee>> {
+        self.supervisees.lock().await.0.get(&room_id).cloned()
+    }
+
     /// Adds a new room to be supervised.
     pub async fn add_room_blocking(
         &self,

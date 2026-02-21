@@ -68,6 +68,10 @@ async fn main() -> Result<()> {
             }),
         )
         .route("/api/rooms", axum::routing::get(api::get_rooms))
+        .route(
+            "/api/rooms/{room_id}/capture",
+            axum::routing::get(api::record_room_msgs),
+        )
         .with_state(sup.clone());
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8080));
