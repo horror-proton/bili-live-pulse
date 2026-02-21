@@ -59,9 +59,23 @@ impl LiveStatus {
         let pool = &self.pool;
 
         trace!(room_id; "Received message: {:?}", msg);
-        match msg {
-            LiveMessage::Message(m) => match m.get("cmd").and_then(|c| c.as_str()) {
+
+        let buf = match msg {
+            LiveMessage::Message(m) => m,
+            _ => return Ok(()),
+        };
+
+        let mut tape_buf = buf.get().as_bytes().to_vec();
+        let tape = simd_json::to_tape(&mut tape_buf).context("Failed to parse message to tape")?;
+        let m = &tape.as_value();
+
+        use simd_json::base::ValueAsScalar;
+        use simd_json::derived::ValueObjectAccessAsScalar;
+
+        {
+            match m.get_str("cmd") {
                 Some("LIVE") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     self.live_status.store(1, Ordering::SeqCst);
                     info!(room_id; "Live started: {}", m);
                     store_live_status_to_db(pool, room_id, 1).await?;
@@ -76,6 +90,7 @@ impl LiveStatus {
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("PREPARING") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     self.live_status.store(0, Ordering::SeqCst);
                     info!(room_id; "Live ended: {}", m);
                     store_live_status_to_db(pool, room_id, 0).await?; // TODO: 0 or 2?
@@ -91,33 +106,42 @@ impl LiveStatus {
                     }
                 }
                 Some("DANMU_MSG") => {
-                    // println!("{} {}", room_id, m.to_string());
-                    if let Some(info) = m.get("info").and_then(|i| i.as_array()) {
+                    // println!("{} {}", room_id, String::from_utf8_lossy(buf));
+                    if let Some(info) = m.get_array("info") {
                         if info.len() >= 3 {
-                            let extra = info[0]
-                                .get(15)
-                                .context("Missing field 15 in info[0]")?
-                                .get("extra")
-                                .context("Missing extra field")?
-                                .as_str()
-                                .context("extra is not a string")?;
-                            let ts = info[0].get(4).and_then(|t| t.as_u64()).unwrap_or(0);
+                            let info0 = info
+                                .get(0)
+                                .context("Missing field 0 in info[0]")?
+                                .as_array()
+                                .context("Field 0 in info[0] is not an array")?;
+                            let info015 = info0.get(15).context("Missing field 15 in info[0]")?;
+                            let extra = info015.get_str("extra").context("Missing extra field")?;
+                            let ts = info0.get(4).and_then(|t| t.as_u64()).unwrap_or(0);
                             let id = serde_json::from_str::<serde_json::Value>(extra)?
                                 .get("id_str")
                                 .context("Missing id_str in extra")?
                                 .as_str()
                                 .context("id_str is not a string")?
                                 .to_string();
-                            let content = info[1].as_str().unwrap_or("");
-                            store_danmaku_to_db(pool, ts, id.as_str(), room_id, content).await?;
+                            let content = info.get(1);
+                            store_danmaku_to_db(
+                                pool,
+                                ts,
+                                id.as_str(),
+                                room_id,
+                                content.as_str().unwrap_or(""),
+                            )
+                            .await?;
                         }
                     }
                 }
                 Some("GUARD_BUY") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     let record = model::Guard::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("WATCHED_CHANGE") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     if self.live_status.load(Ordering::SeqCst) != 1 {
                         return Ok(());
                     }
@@ -128,6 +152,7 @@ impl LiveStatus {
                     if self.live_status.load(Ordering::SeqCst) != 1 {
                         return Ok(());
                     }
+                    let m = &serde_json::value::to_value(buf)?;
                     let record = model::OnlineCount::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
@@ -135,15 +160,18 @@ impl LiveStatus {
                     if self.live_status.load(Ordering::SeqCst) != 1 {
                         return Ok(());
                     }
+                    let m = &serde_json::value::to_value(buf)?;
                     let record = model::LikeInfo::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("ROOM_CHANGE") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     info!(room_id; "Room info changed {}", m);
                     let record = model::RoomInfo::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
                 Some("ROOM_REAL_TIME_MESSAGE_UPDATE") => {
+                    let m = &serde_json::value::to_value(buf)?;
                     let record = model::RealTimeMessage::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
@@ -161,10 +189,8 @@ impl LiveStatus {
                 Some("ENTRY_EFFECT") => {}
                 Some("NOTICE_MSG") => {}
                 Some("LOG_IN_NOTICE") => {}
-                _ => debug!(room_id; "Other command: {}", m.to_string()),
-            },
-
-            _ => {}
+                _ => debug!(room_id; "Other command: {}", buf),
+            };
         };
 
         Ok(())

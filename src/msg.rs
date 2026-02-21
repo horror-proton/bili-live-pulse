@@ -12,7 +12,6 @@ use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::protocol;
 use tokio_util::sync::CancellationToken;
@@ -30,21 +29,36 @@ pub enum Operation {
     AuthReply = 8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum LiveMessage {
     Heartbeat(Vec<u8>),
     HeartbeatReply((u32, Vec<u8>)),
-    Message(serde_json::Value),
+    Message(Box<serde_json::value::RawValue>),
     Auth(serde_json::Value),
     AuthReply(serde_json::Value),
     Unknown,
 }
 
+impl PartialEq for LiveMessage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Heartbeat(l0), Self::Heartbeat(r0)) => l0 == r0,
+            (Self::HeartbeatReply(l0), Self::HeartbeatReply(r0)) => l0 == r0,
+            (Self::Message(l0), Self::Message(r0)) => l0.get() == r0.get(),
+            (Self::Auth(l0), Self::Auth(r0)) => l0 == r0,
+            (Self::AuthReply(l0), Self::AuthReply(r0)) => l0 == r0,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for LiveMessage {}
+
 // sequence global variable
 static SEQUENCE: AtomicU32 = AtomicU32::new(1);
 
 impl LiveMessage {
-    pub fn from_payload(payload: &[u8], operation: u32) -> Self {
+    pub fn from_payload(payload: Vec<u8>, operation: u32) -> Self {
         const HBR: u32 = Operation::HeartbeatReply as u32;
         const MSG: u32 = Operation::Message as u32;
         const AR: u32 = Operation::AuthReply as u32;
@@ -59,12 +73,11 @@ impl LiveMessage {
                 }
             }
             MSG => {
-                if let Ok(text) = String::from_utf8(payload.to_vec()) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        LiveMessage::Message(json)
-                    } else {
-                        LiveMessage::Unknown
-                    }
+                // TODO: prevent copy?
+                if let Ok(raw) =
+                    serde_json::from_slice::<Box<serde_json::value::RawValue>>(&payload)
+                {
+                    LiveMessage::Message(raw)
                 } else {
                     LiveMessage::Unknown
                 }
@@ -314,7 +327,7 @@ impl MsgConnection {
         if let protocol::Message::Binary(bin) = rsp {
             let decompressed = decompress_packet(&bin).context("Failed to decompress packet")?;
             for (decompressed_data, operation) in decompressed {
-                let rsp = LiveMessage::from_payload(&decompressed_data, operation);
+                let rsp = LiveMessage::from_payload(decompressed_data, operation);
                 if let LiveMessage::AuthReply(_) = rsp {
                 } else {
                     return Err(MsgError::AnyhowError(anyhow::anyhow!(
@@ -351,7 +364,7 @@ impl MsgConnection {
             warn!("Decompressed into {} packets", decompressed.len());
         }
         for (data, op) in decompressed {
-            let live_msg = LiveMessage::from_payload(&data, op);
+            let live_msg = LiveMessage::from_payload(data, op);
 
             if let LiveMessage::HeartbeatReply(_) = &live_msg {
                 // println!("Received heartbeat reply");

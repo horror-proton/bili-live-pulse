@@ -126,7 +126,12 @@ async fn ensure_connection_impl(
         info!(room_id; "Comparing connections");
         let mut cmp = Comparator2::new(lhs_rx, rhs_rx).with_filter(|m: &LiveMessage| match m {
             LiveMessage::HeartbeatReply(_) => false,
-            LiveMessage::Message(Value::Object(obj)) => {
+            LiveMessage::Message(buf) => {
+                let obj = if let Ok(v) = serde_json::to_value(buf) {
+                    v
+                } else {
+                    return true;
+                };
                 if let Some(Value::String(s)) = obj.get("cmd") {
                     if s == "LOG_IN_NOTICE" {
                         return false;

@@ -12,7 +12,8 @@ hyper = { version = "1", features = [] }
 axum = { version = "0.8", features = ["http1", "json", "tokio", "tower-log"]}
 axum-extra = { version = "0", features = ["erased-json"]}
 http-body-util = "0"
-serde_json = "1.0.145"
+serde_json = { version = "1", features = ["raw_value"]}
+simd-json = "0"
 tokio = { version = "1.47.1", features = ["libc", "macros", "rt", "time"] }
 tokio-util = "0"
 tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
