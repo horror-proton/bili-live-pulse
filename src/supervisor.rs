@@ -1,4 +1,5 @@
 use anyhow::Result;
+use axum::http::StatusCode;
 use log::{debug, error, info, trace, warn};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 
 use crate::client::ApiClient;
 use crate::live_status::LiveStatus;
@@ -23,6 +25,7 @@ pub struct Supervisee {
     pub live_status: Arc<LiveStatus>,
     pub connection_ready: Arc<AtomicBool>,
     pub message_tx: broadcast::Sender<msg::LiveMessage>,
+    pub cancel_token: Arc<Mutex<CancellationToken>>,
 }
 
 pub struct Supervisor {
@@ -88,10 +91,12 @@ impl Supervisor {
         let (message_tx, mut message_rx) = broadcast::channel::<msg::LiveMessage>(128);
 
         let connection_ready = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(Mutex::new(CancellationToken::new()));
         let supervisee = Supervisee {
             live_status: live_status.clone(),
             connection_ready: connection_ready.clone(),
             message_tx: message_tx.clone(),
+            cancel_token: cancel_token.clone(),
         };
         let ee = Arc::new(supervisee);
         let ee = supervisees.0.entry(room_id).or_insert(ee).clone();
@@ -121,7 +126,8 @@ impl Supervisor {
         });
 
         info!(room_id; "Adding and starting watch for room {}.", room_id);
-        self.start_room_watch(room_id, message_tx).await?;
+        self.start_room_watch(room_id, message_tx, cancel_token)
+            .await?;
 
         ee.connection_ready.store(true, Ordering::SeqCst);
         match ee.live_status.concile_status().await {
@@ -137,8 +143,15 @@ impl Supervisor {
         &self,
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
+        cancel_token: Arc<Mutex<CancellationToken>>,
     ) -> Result<()> {
-        let mut room_watch = RoomWatch::new(room_id, self.cli.clone(), message_tx);
+        let cancel_token_guard = cancel_token.lock().await;
+        let mut room_watch = RoomWatch::new(
+            room_id,
+            self.cli.clone(),
+            message_tx,
+            cancel_token_guard.clone(),
+        );
 
         let task = room_watch.start().await?;
 
@@ -155,8 +168,15 @@ impl Supervisor {
         &self,
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
+        cancel_token: Arc<Mutex<CancellationToken>>,
     ) {
-        let mut room_watch = RoomWatch::new(room_id, self.cli.clone(), message_tx);
+        let cancel_token_guard = cancel_token.lock().await;
+        let mut room_watch = RoomWatch::new(
+            room_id,
+            self.cli.clone(),
+            message_tx,
+            cancel_token_guard.clone(),
+        );
         self.room_watch_join_set.lock().await.spawn(async move {
             match room_watch.start().await {
                 Ok(task) => match task.await {
@@ -168,21 +188,45 @@ impl Supervisor {
         });
     }
 
+    /// Restarts the room connection (RoomWatch task) by notifying the cancel token.
+    ///
+    /// This is useful when the coordinator observes unreliable connections
+    /// or message inconsistencies.
+    ///
+    /// This cancels the current connection and lets handle_room_watch_failure
+    /// automatically restart it with a fresh connection.
+    pub async fn restart_room(&self, room_id: u32) -> Result<(), StatusCode> {
+        let supervisee = self.get_room(room_id).await.ok_or(StatusCode::NOT_FOUND)?;
+        info!(room_id; "Restarting room connection for room {}", room_id);
+
+        // Cancel the current connection - handle_room_watch_failure will restart it
+        let cancel_token = supervisee.cancel_token.lock().await;
+        cancel_token.cancel();
+
+        // Mark connection as not ready during restart
+        supervisee.connection_ready.store(false, Ordering::SeqCst);
+
+        // TODO: wait till the the connection is restarted?
+        Ok(())
+    }
+
     async fn handle_room_watch_failure(
         &self,
         res: Result<(u32, Result<()>), tokio::task::JoinError>,
     ) {
         match res {
             Ok((room_id, task_result)) => {
-                let message_tx = self
-                    .supervisees
-                    .lock()
-                    .await
-                    .0
-                    .get(&room_id)
-                    .unwrap()
-                    .message_tx
-                    .clone();
+                let (message_tx, cancel_token_arc) = {
+                    let supervisees = self.supervisees.lock().await;
+                    let supervisee = supervisees.0.get(&room_id).unwrap();
+
+                    supervisee.connection_ready.store(false, Ordering::SeqCst); // TODO
+
+                    (
+                        supervisee.message_tx.clone(),
+                        supervisee.cancel_token.clone(),
+                    )
+                };
                 match task_result {
                     Ok(()) => {
                         // Task completed gracefully.
@@ -191,9 +235,13 @@ impl Supervisor {
                             "Room watch for room {} exited gracefully. Restarting...",
                             room_id
                         );
-                        // restart?
+                        // Create new cancel token for the restarted task
+                        let new_cancel_token = Arc::new(Mutex::new(CancellationToken::new()));
+                        // Update the supervisee with the new cancel token
+                        *cancel_token_arc.lock().await = new_cancel_token.lock().await.clone();
                         time::sleep(Duration::from_secs(5)).await;
-                        self.restart_room_watch(room_id, message_tx).await;
+                        self.restart_room_watch(room_id, message_tx, new_cancel_token)
+                            .await;
                     }
                     Err(e) => {
                         error!(
@@ -202,8 +250,13 @@ impl Supervisor {
                             room_id,
                             e
                         );
+                        // Create new cancel token for the restarted task
+                        let new_cancel_token = Arc::new(Mutex::new(CancellationToken::new()));
+                        // Update the supervisee with the new cancel token
+                        *cancel_token_arc.lock().await = new_cancel_token.lock().await.clone();
                         time::sleep(Duration::from_secs(5)).await;
-                        self.restart_room_watch(room_id, message_tx).await;
+                        self.restart_room_watch(room_id, message_tx, new_cancel_token)
+                            .await;
                     }
                 }
             }

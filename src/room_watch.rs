@@ -19,9 +19,7 @@ pub struct RoomWatch {
 
     msg_rl: Arc<RateLimiter>, // TODO: move to cli
 
-    // consumer: Option<JoinHandle<Result<()>>>,
     message_tx: broadcast::Sender<msg::LiveMessage>,
-    // message_rx: broadcast::Receiver<msg::LiveMessage>,
 }
 
 impl RoomWatch {
@@ -29,15 +27,14 @@ impl RoomWatch {
         room_id: u32,
         cli: Arc<ApiClient>,
         message_tx: broadcast::Sender<msg::LiveMessage>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             room_id,
             cli,
-            cancel_token: CancellationToken::new(),
+            cancel_token,
             msg_rl: Arc::new(RateLimiter::default()),
-            // consumer: None,
             message_tx,
-            // message_rx: rx,
         }
     }
 
