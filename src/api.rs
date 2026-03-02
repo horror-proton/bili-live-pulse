@@ -53,8 +53,15 @@ pub async fn record_room_msgs(
 
     let mut vec = Vec::new();
 
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(timeout);
+
     loop {
         tokio::select! {
+            biased;
+            _ = &mut timeout => {
+                break;
+            },
             res = chan.recv() => {
                 match res {
                     Ok(msg::LiveMessage::Message(msg)) => {
@@ -72,9 +79,6 @@ pub async fn record_room_msgs(
                     _ => {}
                 }
             },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                break;
-            }
         }
     }
 
