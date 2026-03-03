@@ -1,7 +1,10 @@
 use axum::extract::Path;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum_extra::response::ErasedJson;
+use futures_util::stream::{self, Stream};
+use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -85,6 +88,86 @@ pub async fn record_room_msgs(
     // let hdr = [(axum::http::header::CACHE_CONTROL, "no-cache")];
 
     Ok(ErasedJson::pretty(vec))
+}
+
+fn live_message_to_sse_event(event_id: u64, live_msg: msg::LiveMessage) -> Event {
+    match live_msg {
+        msg::LiveMessage::Message(raw) => Event::default()
+            .id(event_id.to_string())
+            .event("message")
+            .data(raw.get().to_string()),
+
+        msg::LiveMessage::HeartbeatReply((ninki, payload)) => Event::default()
+            .id(event_id.to_string())
+            .event("heartbeat_reply")
+            .data(
+                serde_json::json!({
+                    "ninki": ninki,
+                    "payload_hex": hex::encode(payload),
+                })
+                .to_string(),
+            ),
+
+        msg::LiveMessage::AuthReply(value) => Event::default()
+            .id(event_id.to_string())
+            .event("auth_reply")
+            .data(value.to_string()),
+
+        msg::LiveMessage::Heartbeat(payload) => Event::default()
+            .id(event_id.to_string())
+            .event("heartbeat")
+            .data(hex::encode(payload)),
+
+        msg::LiveMessage::Auth(value) => Event::default()
+            .id(event_id.to_string())
+            .event("auth")
+            .data(value.to_string()),
+
+        msg::LiveMessage::Unknown => Event::default()
+            .id(event_id.to_string())
+            .event("unknown")
+            .data("{}"),
+    }
+}
+
+/// Stream room messages over Server-Sent Events (SSE).
+///
+/// Example: `GET /api/rooms/12345/sse`
+pub async fn stream_room_msgs_sse(
+    State(sup): State<Arc<Supervisor>>,
+    Path(room_id): Path<u32>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let chan = sup
+        .get_room(room_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?
+        .message_tx
+        .subscribe();
+
+    let event_stream = stream::unfold((chan, 1u64), |(mut chan, event_id)| async move {
+        loop {
+            match chan.recv().await {
+                Ok(live_msg) => {
+                    let event = live_message_to_sse_event(event_id, live_msg);
+                    return Some((Ok(event), (chan, event_id.saturating_add(1))));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let event = Event::default()
+                        .id(event_id.to_string())
+                        .event("lagged")
+                        .data(skipped.to_string());
+                    return Some((Ok(event), (chan, event_id.saturating_add(1))));
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Ok(Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 /// Manually mark a room as connection ready.

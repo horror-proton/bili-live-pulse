@@ -188,6 +188,10 @@ async fn run_instance(
             axum::routing::get(api::record_room_msgs),
         )
         .route(
+            "/api/rooms/{room_id}/sse",
+            axum::routing::get(api::stream_room_msgs_sse),
+        )
+        .route(
             "/api/rooms/{room_id}/connection-ready",
             axum::routing::put(api::mark_room_connection_ready),
         )
