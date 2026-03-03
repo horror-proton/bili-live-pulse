@@ -42,10 +42,10 @@ impl RoomWatch {
         Ok(self.cli.get_room_key(self.room_id).await?)
     }
 
-    pub async fn start(&mut self) -> Result<JoinHandle<Result<()>>> {
+    pub async fn start(&mut self, check: bool) -> Result<JoinHandle<Result<()>>> {
         let room_id = self.room_id;
 
-        let conn = loop {
+        let mut conn = loop {
             // TODO: move into new()
             let key = Arc::new(self.get_new_key().await?);
             let buvid = self.cli.get_buvidv3().await?;
@@ -63,10 +63,11 @@ impl RoomWatch {
             break conn;
         };
 
-        // there's as small chance that we get a nasty connection that returns less events
-        use channel_consistency::ensure_connection;
-        let mut conn =
-            ensure_connection(&self.msg_rl, room_id, self.cli.clone(), Some(conn)).await?;
+        if check {
+            // there's as small chance that we get a nasty connection that returns less events
+            use channel_consistency::ensure_connection;
+            conn = ensure_connection(&self.msg_rl, room_id, self.cli.clone(), Some(conn)).await?;
+        }
 
         info!(room_id; "WebSocket connection established");
 

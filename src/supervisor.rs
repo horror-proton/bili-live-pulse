@@ -21,6 +21,13 @@ use crate::room_watch;
 
 use room_watch::RoomWatch;
 
+#[derive(Default)]
+struct SuperviseeRegistry {
+    // TODO: use indexmap
+    by_room_id: HashMap<u32, Arc<Supervisee>>,
+    concile_queue: VecDeque<u32>,
+}
+
 pub struct Supervisee {
     pub live_status: Arc<LiveStatus>,
     pub connection_ready: Arc<AtomicBool>,
@@ -29,7 +36,7 @@ pub struct Supervisee {
 }
 
 pub struct Supervisor {
-    supervisees: Mutex<(HashMap<u32, Arc<Supervisee>>, VecDeque<u32>)>,
+    supervisees: Mutex<SuperviseeRegistry>,
     pool: PgPool,
 
     cli: Arc<ApiClient>,
@@ -38,16 +45,18 @@ pub struct Supervisor {
     room_watch_join_set: Mutex<JoinSet<(u32, Result<()>)>>,
 
     handlers_join_set: Mutex<JoinSet<()>>,
+    self_check: bool,
 }
 
 impl Supervisor {
-    pub fn new(pool: PgPool, cli: Arc<ApiClient>) -> Self {
+    pub fn new(pool: PgPool, cli: Arc<ApiClient>, self_check: bool) -> Self {
         Self {
-            supervisees: Mutex::new((HashMap::new(), VecDeque::new())),
+            supervisees: Mutex::new(SuperviseeRegistry::default()),
             pool,
             cli,
             room_watch_join_set: Mutex::new(JoinSet::new()),
             handlers_join_set: Mutex::new(JoinSet::new()),
+            self_check,
         }
     }
 
@@ -67,11 +76,16 @@ impl Supervisor {
     }
 
     pub async fn supervisees(&self) -> HashMap<u32, Arc<Supervisee>> {
-        self.supervisees.lock().await.0.clone()
+        self.supervisees.lock().await.by_room_id.clone()
     }
 
     pub async fn get_room(&self, room_id: u32) -> Option<Arc<Supervisee>> {
-        self.supervisees.lock().await.0.get(&room_id).cloned()
+        self.supervisees
+            .lock()
+            .await
+            .by_room_id
+            .get(&room_id)
+            .cloned()
     }
 
     /// Adds a new room to be supervised.
@@ -83,7 +97,7 @@ impl Supervisor {
         info!(room_id; "Adding room {} to supervision.", room_id);
 
         let mut supervisees = self.supervisees.lock().await;
-        if supervisees.0.contains_key(&room_id) {
+        if supervisees.by_room_id.contains_key(&room_id) {
             warn!(room_id; "Room {} is already being supervised.", room_id);
             return Ok(());
         }
@@ -99,8 +113,8 @@ impl Supervisor {
             cancel_token: cancel_token.clone(),
         };
         let ee = Arc::new(supervisee);
-        let ee = supervisees.0.entry(room_id).or_insert(ee).clone();
-        supervisees.1.push_back(room_id);
+        let ee = supervisees.by_room_id.entry(room_id).or_insert(ee).clone();
+        supervisees.concile_queue.push_back(room_id);
 
         drop(supervisees);
 
@@ -126,14 +140,14 @@ impl Supervisor {
         });
 
         info!(room_id; "Adding and starting watch for room {}.", room_id);
-        self.start_room_watch(room_id, message_tx, cancel_token)
+        let self_check = self.self_check;
+        self.start_room_watch(room_id, message_tx, cancel_token, self_check)
             .await?;
 
-        ee.connection_ready.store(true, Ordering::SeqCst);
-        match ee.live_status.concile_status().await {
-            Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
-            Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+        if self_check {
+            ee.connection_ready.store(true, Ordering::SeqCst);
         }
+        // TODO: prepend to concile queue? Wait till ready?
 
         Ok(())
     }
@@ -144,6 +158,7 @@ impl Supervisor {
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
         cancel_token: Arc<Mutex<CancellationToken>>,
+        self_check: bool,
     ) -> Result<()> {
         let cancel_token_guard = cancel_token.lock().await;
         let mut room_watch = RoomWatch::new(
@@ -153,7 +168,7 @@ impl Supervisor {
             cancel_token_guard.clone(),
         );
 
-        let task = room_watch.start().await?;
+        let task = room_watch.start(self_check).await?;
 
         self.room_watch_join_set.lock().await.spawn(async move {
             match task.await {
@@ -169,6 +184,7 @@ impl Supervisor {
         room_id: u32,
         message_tx: broadcast::Sender<msg::LiveMessage>,
         cancel_token: Arc<Mutex<CancellationToken>>,
+        self_check: bool,
     ) {
         let cancel_token_guard = cancel_token.lock().await;
         let mut room_watch = RoomWatch::new(
@@ -178,7 +194,7 @@ impl Supervisor {
             cancel_token_guard.clone(),
         );
         self.room_watch_join_set.lock().await.spawn(async move {
-            match room_watch.start().await {
+            match room_watch.start(self_check).await {
                 Ok(task) => match task.await {
                     Ok(r) => (room_id, r),
                     Err(je) => (room_id, Err(anyhow::anyhow!("Join error: {:#}", je))),
@@ -218,7 +234,7 @@ impl Supervisor {
             Ok((room_id, task_result)) => {
                 let (message_tx, cancel_token_arc) = {
                     let supervisees = self.supervisees.lock().await;
-                    let supervisee = supervisees.0.get(&room_id).unwrap();
+                    let supervisee = supervisees.by_room_id.get(&room_id).unwrap();
 
                     supervisee.connection_ready.store(false, Ordering::SeqCst); // TODO
 
@@ -240,8 +256,13 @@ impl Supervisor {
                         // Update the supervisee with the new cancel token
                         *cancel_token_arc.lock().await = new_cancel_token.lock().await.clone();
                         time::sleep(Duration::from_secs(5)).await;
-                        self.restart_room_watch(room_id, message_tx, new_cancel_token)
-                            .await;
+                        self.restart_room_watch(
+                            room_id,
+                            message_tx,
+                            new_cancel_token,
+                            self.self_check,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         error!(
@@ -255,8 +276,13 @@ impl Supervisor {
                         // Update the supervisee with the new cancel token
                         *cancel_token_arc.lock().await = new_cancel_token.lock().await.clone();
                         time::sleep(Duration::from_secs(5)).await;
-                        self.restart_room_watch(room_id, message_tx, new_cancel_token)
-                            .await;
+                        self.restart_room_watch(
+                            room_id,
+                            message_tx,
+                            new_cancel_token,
+                            self.self_check,
+                        )
+                        .await;
                     }
                 }
             }
@@ -269,12 +295,12 @@ impl Supervisor {
     async fn handle_room_concilation(&self) {
         let (room_id, live_status) = {
             let mut supervisees = self.supervisees.lock().await;
-            let room_id = match supervisees.1.pop_front() {
+            let room_id = match supervisees.concile_queue.pop_front() {
                 Some(id) => id,
                 None => return,
             };
 
-            let live_status = match supervisees.0.get(&room_id) {
+            let live_status = match supervisees.by_room_id.get(&room_id) {
                 Some(s) => s.live_status.clone(),
                 None => return,
             };
@@ -287,6 +313,10 @@ impl Supervisor {
             Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
         }
 
-        self.supervisees.lock().await.1.push_back(room_id);
+        self.supervisees
+            .lock()
+            .await
+            .concile_queue
+            .push_back(room_id);
     }
 }

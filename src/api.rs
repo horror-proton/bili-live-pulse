@@ -95,10 +95,7 @@ pub async fn mark_room_connection_ready(
     State(sup): State<Arc<Supervisor>>,
     Path(room_id): Path<u32>,
 ) -> Result<ErasedJson, StatusCode> {
-    let supervisee = sup
-        .get_room(room_id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let supervisee = sup.get_room(room_id).await.ok_or(StatusCode::NOT_FOUND)?;
 
     supervisee.connection_ready.store(true, Ordering::SeqCst);
 

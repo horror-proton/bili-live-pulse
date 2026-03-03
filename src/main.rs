@@ -31,6 +31,8 @@ struct Args {
     coordinator_instances: String,
     /// Port to listen on (default: 8080).
     port: u16,
+    /// Self check connections
+    self_check: bool,
 }
 
 impl Args {
@@ -40,6 +42,7 @@ impl Args {
             coordinator_poll_interval: 330,
             coordinator_instances: String::new(),
             port: 8080,
+            self_check: true,
         };
 
         let mut argv = std::env::args().skip(1);
@@ -63,6 +66,9 @@ impl Args {
                     if let Some(val) = argv.next() {
                         args.port = val.parse().unwrap_or(8080);
                     }
+                }
+                "--no-self-check" => {
+                    args.self_check = false;
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -119,11 +125,15 @@ async fn main() -> Result<()> {
         return run_coordinator(args).await;
     }
 
-    run_instance(args.port).await
+    run_instance(args).await
 }
 
 /// Run as a regular instance (websocket connection handler).
-async fn run_instance(port: u16) -> Result<()> {
+async fn run_instance(
+    Args {
+        port, self_check, ..
+    }: Args,
+) -> Result<()> {
     let dml =
         std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
 
@@ -151,17 +161,24 @@ async fn run_instance(port: u16) -> Result<()> {
     info!("Instance ID: {}", instance_id);
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
     let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
-    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone()));
+    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone(), self_check));
 
+    use axum::extract::State;
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "Ok\r\n" }))
         .route(
             "/readyz",
-            axum::routing::get(|| async {
-                if READY.load(Ordering::SeqCst) {
-                    (StatusCode::OK, "Ok\r\n")
+            axum::routing::get(|State(sup): State<Arc<Supervisor>>| async move {
+                if READY.load(Ordering::SeqCst)
+                    && sup
+                        .supervisees()
+                        .await
+                        .iter()
+                        .all(|(_, ee)| ee.connection_ready.load(Ordering::SeqCst))
+                {
+                    (StatusCode::OK, "Ready\r\n".to_string())
                 } else {
-                    (StatusCode::SERVICE_UNAVAILABLE, "Not Ready\r\n")
+                    (StatusCode::SERVICE_UNAVAILABLE, "Not Ready\r\n".to_string())
                 }
             }),
         )
