@@ -91,13 +91,15 @@ jobs:
       - name: Push image
         run: |
           set -o pipefail
-
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
           tag=runs-${{ github.run_id }}
 
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker tag bili-live-pulse:$tag ghcr.io/${{ github.repository_owner }}/bili-live-pulse:$tag
           docker push ghcr.io/${{ github.repository_owner }}/bili-live-pulse:$tag
+
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ secrets.REGISTRY }} -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+          docker tag bili-live-pulse:$tag ${{ secrets.REGISTRY }}/bili-live-pulse/bili-live-pulse:$tag
+          docker push ${{ secrets.REGISTRY }}/bili-live-pulse/bili-live-pulse:$tag
 
           docker save bili-live-pulse:$tag | gzip > bili-live-pulse.tar.gz
 
