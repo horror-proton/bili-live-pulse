@@ -46,11 +46,7 @@ pub trait ComparisonAlgorithm: Send + Sync {
     /// # Arguments
     /// * `room_id` - The room being compared
     /// * `captures` - A slice of (instance_id, messages) tuples from each instance
-    fn compare(
-        &self,
-        room_id: u32,
-        captures: &[(String, Vec<String>, Duration)],
-    ) -> ComparisonResult;
+    fn compare(&self, room_id: u32, captures: &[(String, Vec<String>)]) -> ComparisonResult;
 }
 
 /// Coordinator that polls instances and manages room connection readiness.
@@ -217,7 +213,7 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
             ComparisonResult::Ready => {
                 info!("Room {} comparison passed, marking as ready", room_id);
                 // Mark the room of all the instances ready
-                for (instance_id, _, _) in captures {
+                for (instance_id, _) in captures {
                     if let Some(instance) = instances.iter().find(|i| i.id == instance_id) {
                         if let Err(e) = self.mark_room_ready(instance, room_id).await {
                             error!(
@@ -252,7 +248,7 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
         &self,
         instances: &[Instance],
         room_id: u32,
-    ) -> anyhow::Result<Vec<(String, Vec<String>, Duration)>> {
+    ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
         use futures_util::future::join_all;
 
         // Create capture futures for all instances
@@ -279,7 +275,7 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
                     instance.id, duration, e
                 ),
             }
-            (instance.id.clone(), result, duration)
+            (instance.id.clone(), result)
         });
 
         // Execute all captures concurrently
@@ -288,7 +284,7 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
         // Filter successful captures
         let captures = results
             .into_iter()
-            .filter_map(|(id, result, duration)| result.ok().map(|msgs| (id, msgs, duration)))
+            .filter_map(|(id, result)| result.ok().map(|msgs| (id, msgs)))
             .collect();
 
         Ok(captures)
@@ -437,18 +433,14 @@ fn lcs_distance<T: Eq>(a: &[T], b: &[T]) -> usize {
 }
 
 impl ComparisonAlgorithm for StubComparisonAlgorithm {
-    fn compare(
-        &self,
-        room_id: u32,
-        captures: &[(String, Vec<String>, Duration)],
-    ) -> ComparisonResult {
+    fn compare(&self, room_id: u32, captures: &[(String, Vec<String>)]) -> ComparisonResult {
         if captures.len() < 2 {
             return ComparisonResult::Inconsistent {
-                worst_instances: captures.iter().map(|(id, _, _)| id.clone()).collect(),
+                worst_instances: captures.iter().map(|(id, _)| id.clone()).collect(),
             };
         }
 
-        for (i, (_, msgs, _)) in captures.iter().enumerate() {
+        for (i, (_, msgs)) in captures.iter().enumerate() {
             if msgs.len() < 3 {
                 return ComparisonResult::Inconsistent {
                     worst_instances: vec![captures[i].0.clone()],
@@ -532,12 +524,10 @@ mod tests {
             (
                 "instance-1".to_string(),
                 vec!["a".to_string(), "b".to_string(), "c".to_string()],
-                Duration::from_secs(300),
             ),
             (
                 "instance-2".to_string(),
                 vec!["a".to_string(), "b".to_string(), "c".to_string()],
-                Duration::from_secs(310),
             ),
         ];
         assert!(matches!(
@@ -550,15 +540,10 @@ mod tests {
     fn test_stub_comparison_too_few() {
         let algo = StubComparisonAlgorithm;
         let captures = vec![
-            (
-                "instance-1".to_string(),
-                vec!["a".to_string()],
-                Duration::from_secs(300),
-            ),
+            ("instance-1".to_string(), vec!["a".to_string()]),
             (
                 "instance-2".to_string(),
                 vec!["a".to_string(), "b".to_string(), "c".to_string()],
-                Duration::from_secs(310),
             ),
         ];
         let result = algo.compare(123, &captures);
@@ -584,7 +569,6 @@ mod tests {
                     "7".to_string(),
                     "8".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
             (
                 "instance-2".to_string(),
@@ -597,7 +581,6 @@ mod tests {
                     "8".to_string(),
                     "9".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
         ];
         assert!(matches!(
@@ -621,7 +604,6 @@ mod tests {
                     "6".to_string(),
                     "7".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
             (
                 "instance-2".to_string(),
@@ -632,7 +614,6 @@ mod tests {
                     "9".to_string(),
                     "10".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
         ];
         let result = algo.compare(123, &captures);
@@ -658,7 +639,6 @@ mod tests {
                     "6".to_string(),
                     "7".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
             (
                 "instance-2".to_string(),
@@ -671,7 +651,6 @@ mod tests {
                     "7".to_string(),
                     "8".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
             (
                 "instance-3".to_string(),
@@ -684,7 +663,6 @@ mod tests {
                     "14".to_string(),
                     "15".to_string(),
                 ],
-                Duration::from_secs(300),
             ),
         ];
         let result = algo.compare(123, &captures);

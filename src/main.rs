@@ -37,12 +37,13 @@ struct Args {
 
 impl Args {
     fn parse() -> Self {
+        let no_self_check_env = std::env::var_os("NO_SELF_CHECK").is_some();
         let mut args = Args {
             coordinator: false,
-            coordinator_poll_interval: 330,
+            coordinator_poll_interval: 30,
             coordinator_instances: String::new(),
             port: 8080,
-            self_check: true,
+            self_check: !no_self_check_env,
         };
 
         let mut argv = std::env::args().skip(1);
@@ -96,12 +97,14 @@ Options:
                              Comma-separated list of instance URLs for stub service discovery
                              (e.g., "http://localhost:8080,http://localhost:8081")
   --port <PORT>              Port to listen on (default: 8080)
+  --no-self-check            Disable self-check connections
   --help, -h                 Show this help message
 
 Environment variables:
   DATABASE_URL               PostgreSQL connection string
   LIVE_ROOM_ID               Comma-separated list of room IDs to monitor
   LIVE_CONCURRENT_ATTEMPT    Number of concurrent connection attempts (default: 5)
+  NO_SELF_CHECK              If set, disables self-check connections
 
 Examples:
   # Run as a regular instance monitoring rooms
