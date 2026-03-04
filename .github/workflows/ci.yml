@@ -88,6 +88,11 @@ jobs:
 
           sha=$(docker inspect --format='{{.Id}}' bili-live-pulse:$tag)
 
+      - name: Smoke Test
+        run: |
+          tag=runs-${{ github.run_id }}
+          docker run --rm bili-live-pulse:$tag --help
+
       - name: Push image
         run: |
           set -o pipefail
@@ -107,10 +112,6 @@ jobs:
         with:
           name: image
           path: bili-live-pulse.tar.gz
-
-      - name: Smoke Test
-        run: |
-          echo "TODO"
 
   upload:
     runs-on: ubuntu-latest
