@@ -302,6 +302,8 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(300);
+
         let mut event_stream = reqwest::Client::new()
             .get(&url)
             .send()
@@ -312,7 +314,12 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
 
         let mut messages = Vec::new();
 
-        while let Some(Some(event)) = event_stream.next().with_cancellation_token(cancel).await {
+        while let Ok(Some(Some(event))) = event_stream
+            .next()
+            .with_cancellation_token(cancel)
+            .timeout_at(deadline)
+            .await
+        {
             match event {
                 Ok(ev) => {
                     if ev.event == "message" {

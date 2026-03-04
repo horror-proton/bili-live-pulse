@@ -15,7 +15,7 @@ http-body-util = "0"
 serde_json = { version = "1", features = ["raw_value"]}
 simd-json = "0"
 tokio = { version = "1.47.1", features = ["libc", "macros", "rt", "time"] }
-tokio-util = "0"
+tokio-util = { version = "0", features = ["time"] }
 tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 reqwest = { version = "0", default-features = false, features = ["native-tls", "query", "json", "stream", "system-proxy"] }
