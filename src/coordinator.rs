@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use tokio::time::Duration;
+use tokio_util::{future::FutureExt, sync::CancellationToken};
 
 /// Represents a room's status from an instance's perspective.
 #[derive(Debug, Clone, Deserialize)]
@@ -229,8 +230,8 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
             }
             ComparisonResult::Inconsistent { worst_instances } => {
                 if let Some(w) = worst_instances.first() {
-                    warn!(room_id; "Comparison failed, restarting worst instance(s): {:?}", w);
-                    // Restart only the worst instance(s)
+                    warn!(room_id; "Comparison failed, restarting the worst instance: {:?}", w);
+                    // Restart only the worst instance
                     if let Some(instance) = instances.iter().find(|i| &i.id == w) {
                         if let Err(e) = self.restart_room(instance, room_id).await {
                             error!(
@@ -255,11 +256,29 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
         use futures_util::future::join_all;
 
         // Create capture futures for all instances
-        let capture_futures = instances.iter().map(|instance| async move {
+        let cancel_token = CancellationToken::new();
+        let capture_futures = instances.iter().map(|instance| async {
+            let cancel_token = cancel_token.clone();
             let start = tokio::time::Instant::now();
-            let result = self.capture_room_messages(instance, room_id).await;
+            let result = self
+                .capture_room_messages(instance, room_id, &cancel_token)
+                .await;
             let duration = start.elapsed();
-            debug!(room_id; "{}: {:?} messages in {:?}", instance.id, result.as_ref().map(|msgs| msgs.len()), duration);
+
+            cancel_token.cancel(); // cancel captures of other instances
+
+            match result {
+                Ok(ref msgs) => info!(
+                    room_id; "{}: captured {} messages in {:?}",
+                    instance.id,
+                    msgs.len(),
+                    duration
+                ),
+                Err(ref e) => warn!(
+                    room_id; "{}: capture failed after {:?}: {:#}",
+                    instance.id, duration, e
+                ),
+            }
             (instance.id.clone(), result, duration)
         });
 
@@ -280,21 +299,42 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
         &self,
         instance: &Instance,
         room_id: u32,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/api/rooms/{}/capture", instance.base_url, room_id);
+        let url = format!("{}/api/rooms/{}/sse", instance.base_url, room_id);
 
-        let response = self
-            .http_client
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let mut event_stream = reqwest::Client::new()
             .get(&url)
-            .timeout(Duration::from_secs(310))
             .send()
-            .await?;
+            .await?
+            .error_for_status()?
+            .bytes_stream()
+            .eventsource();
 
-        if !response.status().is_success() {
-            anyhow::bail!("Capture returned status {}", response.status());
+        let mut messages = Vec::new();
+
+        while let Some(Some(event)) = event_stream.next().with_cancellation_token(cancel).await {
+            match event {
+                Ok(ev) => {
+                    if ev.event == "message" {
+                        messages.push(ev.data);
+                        if messages.len() >= 20 {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Error reading SSE from instance {} for room {}: {:#}",
+                        instance.id, room_id, e
+                    );
+                    break;
+                }
+            }
         }
-
-        let messages: Vec<String> = response.json().await?;
         Ok(messages)
     }
 
@@ -454,9 +494,10 @@ impl ComparisonAlgorithm for StubComparisonAlgorithm {
         if n == 2 {
             let mut idx = vec![0, 1];
             idx.sort_by(|l, r| {
-                captures[*r]
-                    .2
-                    .cmp(&captures[*l].2)
+                captures[*l]
+                    .1
+                    .len()
+                    .cmp(&captures[*r].1.len())
                     .then_with(|| total_distance[*r].cmp(&total_distance[*l]))
             });
 
@@ -566,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stub_comparison_two_instances_inconsistent_restarts_slow() {
+    fn test_stub_comparison_two_instances_inconsistent_restarts_less() {
         let algo = StubComparisonAlgorithm;
         let captures = vec![
             (
@@ -577,8 +618,10 @@ mod tests {
                     "3".to_string(),
                     "4".to_string(),
                     "5".to_string(),
+                    "6".to_string(),
+                    "7".to_string(),
                 ],
-                Duration::from_secs(100),
+                Duration::from_secs(300),
             ),
             (
                 "instance-2".to_string(),
@@ -594,10 +637,7 @@ mod tests {
         ];
         let result = algo.compare(123, &captures);
         if let ComparisonResult::Inconsistent { worst_instances } = result {
-            assert_eq!(
-                worst_instances,
-                vec!["instance-2".to_string(), "instance-1".to_string()]
-            );
+            assert_eq!(worst_instances[0], "instance-2".to_string());
         } else {
             panic!("expected inconsistent");
         }
