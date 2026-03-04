@@ -222,6 +222,11 @@ async fn run_instance(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(5);
 
+    let live_init_wait = std::env::var("LIVE_INIT_WAIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+
     let sem = Arc::new(Semaphore::new(attempt_n));
     let mut set = tokio::task::JoinSet::new();
 
@@ -235,7 +240,7 @@ async fn run_instance(
             sup.add_room_blocking(room_id, live_status).await
         });
         // TODO: use token bucket in cli
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(live_init_wait)).await;
     }
 
     while let Some(res) = set.join_next().await {
