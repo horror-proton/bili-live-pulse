@@ -5,6 +5,8 @@ use super::wbi;
 use crate::{msg, token_bucket::TokenBucket};
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -121,6 +123,53 @@ pub async fn fetch_live_status(room_id: u32) -> Result<model::RoomInfo> {
     ))
 }
 
+async fn fetch_live_status_batch(
+    room_ids: impl Iterator<Item = u32>,
+) -> Result<HashMap<u32, model::RoomInfo>> {
+    const MAX_ROOM_IDS_PER_REQUEST: usize = 50;
+
+    let room_ids = room_ids.collect::<Vec<_>>();
+    if room_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    #[derive(Deserialize)]
+    struct RespData {
+        by_room_ids: HashMap<u32, model::RoomInfo>,
+    }
+
+    #[derive(Deserialize)]
+    struct Resp {
+        data: RespData,
+    }
+
+    let cli = reqwest::Client::new();
+    let mut result = HashMap::new();
+
+    for room_id_batch in room_ids.chunks(MAX_ROOM_IDS_PER_REQUEST) {
+        let mut v = room_id_batch
+            .iter()
+            .map(|room_id| ("room_ids", room_id.to_string()))
+            .collect::<Vec<_>>();
+        v.push(("req_biz", "web_room_componet".to_string()));
+
+        let batch = cli
+            .get("https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo")
+            .query(&v)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Resp>()
+            .await?
+            .data
+            .by_room_ids;
+
+        result.extend(batch);
+    }
+
+    Ok(result)
+}
+
 pub struct ApiClient {
     cli: reqwest::Client,
     wbi_keys: (String, String), // TDDO: update periodicly
@@ -172,6 +221,17 @@ impl ApiClient {
                 Ok(lease)
             }
         }
+    }
+
+    pub async fn get_live_status(&self, room_id: u32) -> Result<model::RoomInfo> {
+        fetch_live_status(room_id).await
+    }
+
+    pub async fn get_live_status_batch(
+        &self,
+        room_ids: impl Iterator<Item = u32>,
+    ) -> Result<HashMap<u32, model::RoomInfo>> {
+        fetch_live_status_batch(room_ids).await
     }
 }
 
