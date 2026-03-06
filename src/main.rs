@@ -29,6 +29,10 @@ struct Args {
     coordinator_poll_interval: u64,
     /// Comma-separated list of instance URLs for stub service discovery.
     coordinator_instances: String,
+    /// DNS name to discover coordinator instances (e.g., headless Kubernetes Service).
+    coordinator_dns: String,
+    /// Port used with DNS-discovered instances (default: 8080).
+    coordinator_dns_port: u16,
     /// Port to listen on (default: 8080).
     port: u16,
     /// Self check connections
@@ -42,6 +46,8 @@ impl Args {
             coordinator: false,
             coordinator_poll_interval: 30,
             coordinator_instances: String::new(),
+            coordinator_dns: String::new(),
+            coordinator_dns_port: 8080,
             port: 8080,
             self_check: !no_self_check_env,
         };
@@ -61,6 +67,16 @@ impl Args {
                 "--coordinator-instances" => {
                     if let Some(val) = argv.next() {
                         args.coordinator_instances = val.to_string();
+                    }
+                }
+                "--coordinator-dns" => {
+                    if let Some(val) = argv.next() {
+                        args.coordinator_dns = val.to_string();
+                    }
+                }
+                "--coordinator-dns-port" => {
+                    if let Some(val) = argv.next() {
+                        args.coordinator_dns_port = val.parse().unwrap_or(8080);
                     }
                 }
                 "--port" => {
@@ -94,8 +110,11 @@ fn print_help() {
 Options:
   --coordinator, --leader    Run as coordinator (leader) mode
   --coordinator-instances <URLS>
-                             Comma-separated list of instance URLs for stub service discovery
+                             Comma-separated list of instance base URLs (static discovery)
                              (e.g., "http://localhost:8080,http://localhost:8081")
+  --coordinator-dns <NAME>   DNS name to discover instance pod IPs (e.g., headless Kubernetes Service)
+  --coordinator-dns-port <PORT>
+                             Port for DNS-discovered instances (default: 8080)
   --port <PORT>              Port to listen on (default: 8080)
   --no-self-check            Disable self-check connections
   --help, -h                 Show this help message
@@ -112,6 +131,9 @@ Examples:
 
   # Run as coordinator with stub service discovery
   ./bili-live-pulse --coordinator --coordinator-instances "http://localhost:8080,http://localhost:8081"
+
+  # Run as coordinator with DNS discovery (e.g., headless Service in Kubernetes)
+  ./bili-live-pulse --coordinator --coordinator-dns bili-live-pulse-instances
 "#
     );
 }
@@ -259,7 +281,33 @@ async fn run_instance(
 async fn run_coordinator(args: Args) -> Result<()> {
     info!("Starting coordinator mode");
 
-    // Parse instance URLs from command line
+    async fn run_with_service_discovery<SD: coordinator::ServiceDiscovery>(
+        service_discovery: SD,
+        poll_interval_secs: u64,
+    ) -> Result<()> {
+        // TODO: Replace with real comparison algorithm implementation
+        let comparison_algorithm = coordinator::StubComparisonAlgorithm;
+
+        let coordinator = coordinator::Coordinator::new(service_discovery, comparison_algorithm)
+            .with_poll_interval(std::time::Duration::from_secs(poll_interval_secs));
+
+        coordinator.run().await?;
+        Ok(())
+    }
+
+    if !args.coordinator_dns.is_empty() {
+        info!(
+            "Using DNS service discovery: name={} port={}",
+            args.coordinator_dns, args.coordinator_dns_port
+        );
+
+        let service_discovery = coordinator::DnsServiceDiscovery::new(args.coordinator_dns)
+            .with_port(args.coordinator_dns_port);
+
+        return run_with_service_discovery(service_discovery, args.coordinator_poll_interval).await;
+    }
+
+    // Parse instance URLs from command line (static discovery)
     let instances: Vec<coordinator::Instance> = args
         .coordinator_instances
         .split(',')
@@ -272,7 +320,9 @@ async fn run_coordinator(args: Args) -> Result<()> {
         .collect();
 
     if instances.is_empty() {
-        error!("No instances specified. Use --coordinator-instances to specify instance URLs.");
+        error!(
+            "No instances specified. Use --coordinator-dns or --coordinator-instances to specify instances."
+        );
         anyhow::bail!("No instances specified");
     }
 
@@ -282,18 +332,6 @@ async fn run_coordinator(args: Args) -> Result<()> {
         instances.iter().map(|i| &i.base_url).collect::<Vec<_>>()
     );
 
-    // TODO: Replace with real service discovery implementation
     let service_discovery = coordinator::StubServiceDiscovery::new(instances);
-
-    // TODO: Replace with real comparison algorithm implementation
-    let comparison_algorithm = coordinator::StubComparisonAlgorithm;
-
-    let coordinator = coordinator::Coordinator::new(service_discovery, comparison_algorithm)
-        .with_poll_interval(std::time::Duration::from_secs(
-            args.coordinator_poll_interval,
-        ));
-
-    coordinator.run().await?;
-
-    Ok(())
+    run_with_service_discovery(service_discovery, args.coordinator_poll_interval).await
 }

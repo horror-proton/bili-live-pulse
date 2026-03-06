@@ -1,7 +1,9 @@
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::Deserialize;
+use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use tokio::time::Duration;
 use tokio_util::{future::FutureExt, sync::CancellationToken};
 
@@ -23,7 +25,9 @@ pub struct Instance {
 /// Service discovery trait - to be implemented for production use.
 pub trait ServiceDiscovery: Send + Sync {
     /// Get all known instances.
-    fn discover_instances(&self) -> Vec<Instance>;
+    fn discover_instances(
+        &self,
+    ) -> impl Future<Output = anyhow::Result<Vec<Instance>>> + Send + '_;
 }
 
 /// Result of comparing captures from multiple instances.
@@ -89,7 +93,13 @@ impl<SD: ServiceDiscovery, CA: ComparisonAlgorithm> Coordinator<SD, CA> {
 
     /// Poll all instances and reconcile room states.
     async fn poll_and_reconcile(&self) -> anyhow::Result<()> {
-        let instances = self.service_discovery.discover_instances();
+        let instances = match self.service_discovery.discover_instances().await {
+            Ok(instances) => instances,
+            Err(e) => {
+                warn!("Service discovery failed: {:#}", e);
+                return Ok(());
+            }
+        };
 
         if instances.is_empty() {
             debug!("No instances discovered");
@@ -399,8 +409,79 @@ impl StubServiceDiscovery {
 }
 
 impl ServiceDiscovery for StubServiceDiscovery {
-    fn discover_instances(&self) -> Vec<Instance> {
-        self.instances.clone()
+    fn discover_instances(
+        &self,
+    ) -> impl Future<Output = anyhow::Result<Vec<Instance>>> + Send + '_ {
+        let instances = self.instances.clone();
+        async move { Ok(instances) }
+    }
+}
+
+/// DNS-based service discovery (e.g., via a headless Kubernetes Service).
+///
+/// This resolves `dns_name` every time `discover_instances()` is called, returning one instance per
+/// resolved IP address.
+#[derive(Debug, Clone)]
+pub struct DnsServiceDiscovery {
+    dns_name: String,
+    port: u16,
+    scheme: String,
+}
+
+impl DnsServiceDiscovery {
+    pub fn new(dns_name: impl Into<String>) -> Self {
+        Self {
+            dns_name: dns_name.into(),
+            port: 8080,
+            scheme: "http".to_string(),
+        }
+    }
+
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    pub fn with_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.scheme = scheme.into();
+        self
+    }
+}
+
+impl ServiceDiscovery for DnsServiceDiscovery {
+    fn discover_instances(
+        &self,
+    ) -> impl Future<Output = anyhow::Result<Vec<Instance>>> + Send + '_ {
+        async move {
+            use std::collections::BTreeSet;
+            use std::net::IpAddr;
+
+            let addrs = tokio::net::lookup_host((self.dns_name.as_str(), self.port))
+                .await
+                .with_context(|| format!("DNS lookup failed for {}", self.dns_name))?;
+
+            let mut ips = BTreeSet::new();
+            for addr in addrs {
+                ips.insert(addr.ip());
+            }
+
+            let instances = ips
+                .into_iter()
+                .map(|ip| {
+                    let host = match ip {
+                        IpAddr::V4(v4) => v4.to_string(),
+                        IpAddr::V6(v6) => format!("[{}]", v6),
+                    };
+
+                    Instance {
+                        id: ip.to_string(),
+                        base_url: format!("{}://{}:{}", self.scheme, host, self.port),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            Ok(instances)
+        }
     }
 }
 
