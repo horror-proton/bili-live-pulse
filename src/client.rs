@@ -153,7 +153,7 @@ async fn fetch_live_status_batch(
             .collect::<Vec<_>>();
         v.push(("req_biz", "web_room_componet".to_string()));
 
-        let batch = cli
+        let mut batch = cli
             .get("https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo")
             .query(&v)
             .send()
@@ -163,6 +163,10 @@ async fn fetch_live_status_batch(
             .await?
             .data
             .by_room_ids;
+
+        for (room_id, info) in batch.iter_mut() {
+            info.room_id = *room_id as i32;
+        }
 
         result.extend(batch);
     }

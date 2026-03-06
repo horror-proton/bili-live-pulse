@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use log::{debug, error, info, trace, warn};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -26,7 +25,6 @@ use room_watch::RoomWatch;
 struct SuperviseeRegistry {
     // TODO: use indexmap
     by_room_id: HashMap<u32, Arc<Supervisee>>,
-    concile_queue: VecDeque<u32>,
 }
 
 pub struct Supervisee {
@@ -90,15 +88,20 @@ impl Supervisor {
     pub async fn run(&self) -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(5));
 
+        let mut concile_interval = time::interval(Duration::from_secs(60));
+
         loop {
-            interval.tick().await;
-
-            let res = self.room_watch_join_set.lock().await.try_join_next();
-            if let Some(res) = res {
-                self.handle_room_watch_failure(res).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    let res = self.room_watch_join_set.lock().await.try_join_next();
+                    if let Some(res) = res {
+                        self.handle_room_watch_failure(res).await;
+                    }
+                },
+                _ = concile_interval.tick() => {
+                    self.handle_room_concilation().await;
+                }
             }
-
-            self.handle_room_concilation().await;
         }
     }
 
@@ -149,7 +152,6 @@ impl Supervisor {
         };
         let ee = Arc::new(supervisee);
         let ee = supervisees.by_room_id.entry(room_id).or_insert(ee).clone();
-        supervisees.concile_queue.push_back(room_id);
 
         drop(supervisees);
 
@@ -182,7 +184,7 @@ impl Supervisor {
         if self_check {
             ee.set_connection_ready(true);
         }
-        // TODO: prepend to concile queue? Wait till ready?
+        // TODO: wait till ready?
 
         Ok(ee)
     }
@@ -328,30 +330,49 @@ impl Supervisor {
     }
 
     async fn handle_room_concilation(&self) {
-        let (room_id, live_status) = {
-            let mut supervisees = self.supervisees.lock().await;
-            let room_id = match supervisees.concile_queue.pop_front() {
-                Some(id) => id,
-                None => return,
-            };
-
-            let live_status = match supervisees.by_room_id.get(&room_id) {
-                Some(s) => s.live_status.clone(),
-                None => return,
-            };
-
-            (room_id, live_status)
+        let live_statuses = {
+            let supervisees = self.supervisees.lock().await;
+            supervisees
+                .by_room_id
+                .iter()
+                .map(|(room_id, s)| (*room_id, s.live_status.clone()))
+                .collect::<Vec<_>>()
         };
 
-        match live_status.concile_status().await {
-            Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
-            Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+        if live_statuses.is_empty() {
+            return;
         }
 
-        self.supervisees
-            .lock()
+        let room_ids = live_statuses
+            .iter()
+            .map(|(room_id, _)| *room_id)
+            .collect::<Vec<_>>();
+
+        let mut room_info_by_room_id = match self
+            .cli
+            .get_live_status_batch(room_ids.iter().copied())
             .await
-            .concile_queue
-            .push_back(room_id);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Error fetching live status batch: {:#}", e);
+                return;
+            }
+        };
+
+        for (room_id, live_status) in live_statuses {
+            let room_info = match room_info_by_room_id.remove(&room_id) {
+                Some(ri) => ri,
+                None => {
+                    warn!(room_id; "Missing room info in batch response");
+                    continue;
+                }
+            };
+
+            match live_status.apply_room_info(room_info).await {
+                Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
+                Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+            }
+        }
     }
 }

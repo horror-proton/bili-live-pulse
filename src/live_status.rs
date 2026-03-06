@@ -37,21 +37,30 @@ impl LiveStatus {
         }
     }
 
-    pub async fn concile_status(&self) -> Result<model::RoomInfo> {
-        let room_info = client::fetch_live_status(self.room_id).await?;
+    pub async fn apply_room_info(&self, mut room_info: model::RoomInfo) -> Result<model::RoomInfo> {
+        room_info.room_id = self.room_id as i32;
 
-        let status = room_info.live_status.unwrap() as i32;
+        let status = room_info
+            .live_status
+            .context("Missing live_status in RoomInfo")? as i32;
         *self.live_id_str.lock().await = room_info.up_session.clone();
-        if status as i32 != self.live_status.load(Ordering::SeqCst) {
-            info!(room_id=self.room_id; "New live_status: {} ({})", status, room_info.title);
+
+        if status != self.live_status.load(Ordering::SeqCst) {
+            info!(room_id = self.room_id; "New live_status: {} ({})", status, room_info.title);
             self.live_status.store(status, Ordering::SeqCst);
             store_live_status_to_db(&self.pool, self.room_id, status).await?;
         }
+
         model::insert_struct(&self.pool, &room_info).await?;
         *self.live_status_updated_at.lock().await = time::Instant::now();
 
         room_info.update_live_meta(&self.pool).await?;
         Ok(room_info)
+    }
+
+    pub async fn concile_status(&self) -> Result<model::RoomInfo> {
+        let room_info = client::fetch_live_status(self.room_id).await?;
+        self.apply_room_info(room_info).await
     }
 
     pub async fn handle_message(&self, msg: &msg::LiveMessage) -> Result<()> {

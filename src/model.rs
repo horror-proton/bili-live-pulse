@@ -36,6 +36,7 @@ pub struct RoomInfo {
     pub parent_area_name: String,
     pub live_status: Option<i16>,
     pub title: String,
+    #[serde(alias = "live_id_str")]
     pub up_session: Option<String>,
 
     #[serde(default)]
@@ -128,7 +129,7 @@ impl RoomInfo {
 
     fn generate_live_meta(&self) -> Option<LiveMeta> {
         let live_key = self.up_session.as_ref()?;
-        if live_key.is_empty() {
+        if live_key.is_empty() || live_key == "0" {
             return None;
         }
         return Some(LiveMeta {
