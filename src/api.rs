@@ -180,7 +180,7 @@ pub async fn mark_room_connection_ready(
 ) -> Result<ErasedJson, StatusCode> {
     let supervisee = sup.get_room(room_id).await.ok_or(StatusCode::NOT_FOUND)?;
 
-    supervisee.connection_ready.store(true, Ordering::SeqCst);
+    supervisee.set_connection_ready(true);
 
     Ok(ErasedJson::pretty(serde_json::json!({
         "room_id": room_id,

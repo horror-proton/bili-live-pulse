@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
@@ -31,8 +32,34 @@ struct SuperviseeRegistry {
 pub struct Supervisee {
     pub live_status: Arc<LiveStatus>,
     pub connection_ready: Arc<AtomicBool>,
+    connection_ready_watch: watch::Sender<bool>,
     pub message_tx: broadcast::Sender<msg::LiveMessage>,
     pub cancel_token: Arc<Mutex<CancellationToken>>,
+}
+
+impl Supervisee {
+    pub(crate) fn set_connection_ready(&self, ready: bool) {
+        self.connection_ready.store(ready, Ordering::SeqCst);
+        self.connection_ready_watch.send_replace(ready);
+    }
+
+    pub async fn wait_connection_ready(&self) {
+        if self.connection_ready.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let mut rx = self.connection_ready_watch.subscribe();
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+
+            if rx.changed().await.is_err() {
+                // Sender dropped; nothing will ever mark this ready again.
+                return;
+            }
+        }
+    }
 }
 
 pub struct Supervisor {
@@ -88,27 +115,35 @@ impl Supervisor {
             .cloned()
     }
 
+    pub async fn wait_room_connection_ready(&self, room_id: u32) -> Result<(), StatusCode> {
+        let supervisee = self.get_room(room_id).await.ok_or(StatusCode::NOT_FOUND)?;
+        supervisee.wait_connection_ready().await;
+        Ok(())
+    }
+
     /// Adds a new room to be supervised.
     pub async fn add_room_blocking(
         &self,
         room_id: u32,
         live_status: Arc<LiveStatus>,
-    ) -> Result<()> {
+    ) -> Result<Arc<Supervisee>> {
         info!(room_id; "Adding room {} to supervision.", room_id);
 
         let mut supervisees = self.supervisees.lock().await;
-        if supervisees.by_room_id.contains_key(&room_id) {
+        if let Some(ee) = supervisees.by_room_id.get(&room_id) {
             warn!(room_id; "Room {} is already being supervised.", room_id);
-            return Ok(());
+            return Ok(ee.clone());
         }
 
         let (message_tx, mut message_rx) = broadcast::channel::<msg::LiveMessage>(128);
 
         let connection_ready = Arc::new(AtomicBool::new(false));
+        let (connection_ready_watch, _connection_ready_watch_rx) = watch::channel(false);
         let cancel_token = Arc::new(Mutex::new(CancellationToken::new()));
         let supervisee = Supervisee {
             live_status: live_status.clone(),
             connection_ready: connection_ready.clone(),
+            connection_ready_watch,
             message_tx: message_tx.clone(),
             cancel_token: cancel_token.clone(),
         };
@@ -145,11 +180,11 @@ impl Supervisor {
             .await?;
 
         if self_check {
-            ee.connection_ready.store(true, Ordering::SeqCst);
+            ee.set_connection_ready(true);
         }
         // TODO: prepend to concile queue? Wait till ready?
 
-        Ok(())
+        Ok(ee)
     }
 
     /// Creates and spawns a RoomWatch task.
@@ -220,7 +255,7 @@ impl Supervisor {
         cancel_token.cancel();
 
         // Mark connection as not ready during restart
-        supervisee.connection_ready.store(false, Ordering::SeqCst);
+        supervisee.set_connection_ready(false);
 
         // TODO: wait till the the connection is restarted?
         Ok(())
@@ -236,7 +271,7 @@ impl Supervisor {
                     let supervisees = self.supervisees.lock().await;
                     let supervisee = supervisees.by_room_id.get(&room_id).unwrap();
 
-                    supervisee.connection_ready.store(false, Ordering::SeqCst); // TODO
+                    supervisee.set_connection_ready(false); // TODO
 
                     (
                         supervisee.message_tx.clone(),
