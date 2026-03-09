@@ -364,6 +364,10 @@ impl MsgConnection {
             warn!("Decompressed into {} packets", decompressed.len());
         }
         for (data, op) in decompressed {
+            if op == Operation::Message as u32 {
+                crate::metrics::inc_messages_received_total();
+            }
+
             let live_msg = LiveMessage::from_payload(data, op);
 
             if let LiveMessage::HeartbeatReply(_) = &live_msg {

@@ -11,6 +11,7 @@ mod client;
 mod coordinator;
 mod live_status;
 mod model;
+mod metrics;
 mod msg;
 mod pgcache;
 mod room_watch;
@@ -124,6 +125,7 @@ Environment variables:
   LIVE_ROOM_ID               Comma-separated list of room IDs to monitor
   LIVE_CONCURRENT_ATTEMPT    Number of concurrent connection attempts (default: 5)
   NO_SELF_CHECK              If set, disables self-check connections
+  (build feature) metrics    If built with `--features metrics`, exposes Prometheus metrics at `GET /metrics`
 
 Examples:
   # Run as a regular instance monitoring rooms
@@ -224,6 +226,7 @@ async fn run_instance(
             "/api/rooms/{room_id}/restart",
             axum::routing::post(api::restart_room_connection),
         )
+        .merge(metrics::router())
         .with_state(sup.clone());
 
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));

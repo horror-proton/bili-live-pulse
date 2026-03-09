@@ -85,6 +85,17 @@ impl Supervisor {
         }
     }
 
+    pub async fn room_counts(&self) -> (usize, usize) {
+        let supervisees = self.supervisees.lock().await;
+        let supervised = supervisees.by_room_id.len();
+        let ready = supervisees
+            .by_room_id
+            .values()
+            .filter(|s| s.connection_ready.load(Ordering::SeqCst))
+            .count();
+        (supervised, ready)
+    }
+
     pub async fn run(&self) -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(5));
 
