@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use base64;
 use brotlic::DecompressorReader;
+use fastrand;
 use flate2::bufread::ZlibDecoder;
 use futures_util::{SinkExt, StreamExt};
 use hyper::Request;
@@ -276,7 +278,11 @@ impl MsgConnection {
         key: Arc<RoomKeyLease>,
         buvid: &str,
     ) -> std::result::Result<Self, MsgError> {
+        use base64::Engine;
         use reqwest::header::*;
+
+        let mut key_bytes = [0u8; 16];
+        fastrand::fill(&mut key_bytes);
 
         let url = "wss://broadcastlv.chat.bilibili.com:443/sub";
         let req = Request::builder()
@@ -291,7 +297,7 @@ impl MsgConnection {
             .header(CONNECTION, "Upgrade")
             .header(SEC_WEBSOCKET_VERSION, "13")
             .header(SEC_WEBSOCKET_EXTENSIONS, "permessage-deflate")
-            .header(SEC_WEBSOCKET_KEY, "chat")
+            .header(SEC_WEBSOCKET_KEY, base64::engine::general_purpose::STANDARD.encode(key_bytes))
             .header(
                 USER_AGENT,
                 "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",

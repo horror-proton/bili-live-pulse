@@ -26,6 +26,7 @@ reqwest = { version = "0", default-features = false, features = ["native-tls", "
 eventsource-stream = "0"
 serde = "1"
 openssl = "0"
+base64 = "0"
 hex = "0"
 uuid = { version = "1", features = ["v4"] }
 log = "0"
