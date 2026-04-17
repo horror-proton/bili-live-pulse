@@ -241,6 +241,7 @@ fn build_packet(message: Vec<u8>, operation: u32, sequence: u32) -> Vec<u8> {
 }
 
 pub struct MsgConnection {
+    room_id: u32,
     key: Arc<RoomKeyLease>,
     read_stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     write_stream: futures_util::stream::SplitSink<
@@ -347,6 +348,7 @@ impl MsgConnection {
         let heartbeat_pending = Arc::new(AtomicBool::new(false));
 
         Ok(MsgConnection {
+            room_id: roomid,
             key,
             read_stream,
             write_stream: write,
@@ -371,7 +373,7 @@ impl MsgConnection {
         }
         for (data, op) in decompressed {
             if op == Operation::Message as u32 {
-                crate::metrics::inc_messages_received_total();
+                crate::metrics::inc_messages_received_total(self.room_id);
             }
 
             let live_msg = LiveMessage::from_payload(data, op);

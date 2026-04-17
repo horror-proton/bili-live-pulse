@@ -6,6 +6,8 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 #[cfg(feature = "metrics")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "metrics")]
+use prometheus_client::metrics::family::Family;
 
 use crate::supervisor::Supervisor;
 
@@ -22,17 +24,25 @@ pub fn router() -> axum::Router<Arc<Supervisor>> {
     }
 }
 
-pub fn inc_messages_received_total() {
+pub fn inc_messages_received_total(room_id: u32) {
     #[cfg(feature = "metrics")]
     {
-        metrics().messages_received_total.inc();
+        metrics()
+            .messages_received_total
+            .get_or_create(&Labels { room_id })
+            .inc();
     }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct Labels {
+    room_id: u32,
 }
 
 #[cfg(feature = "metrics")]
 struct Metrics {
     registry: std::sync::Mutex<prometheus_client::registry::Registry>,
-    messages_received_total: prometheus_client::metrics::counter::Counter,
+    messages_received_total: Family<Labels, prometheus_client::metrics::counter::Counter>,
     rooms_supervised: prometheus_client::metrics::gauge::Gauge,
     rooms_ready: prometheus_client::metrics::gauge::Gauge,
 }
@@ -42,10 +52,11 @@ impl Metrics {
     fn new() -> Self {
         let mut registry = prometheus_client::registry::Registry::default();
 
-        let messages_received_total = prometheus_client::metrics::counter::Counter::default();
+        let messages_received_total =
+            Family::<Labels, prometheus_client::metrics::counter::Counter>::default();
         registry.register(
-            "bili_live_pulse_messages_received_total",
-            "Total number of Bilibili live room messages received (decoded packets with operation=5) across all rooms supervised by this instance.",
+            "bili_live_pulse_messages_received",
+            "Bilibili live room messages received (decoded packets with operation=5).",
             messages_received_total.clone(),
         );
 
