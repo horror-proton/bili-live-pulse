@@ -262,7 +262,12 @@ async fn run_instance(
         let sem = sem.clone();
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            sup.add_room_blocking(room_id, live_status).await
+            let _ = sup
+                .add_room_blocking(room_id, live_status)
+                .await
+                .map_err(|e| {
+                    warn!(room_id; "Failed to connect room: {}",  e);
+                });
         });
         // TODO: use token bucket in cli
         tokio::time::sleep(std::time::Duration::from_secs(live_init_wait)).await;
