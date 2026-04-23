@@ -88,8 +88,8 @@ impl Insertable for RoomInfo {
         query!(
             r#"
             WITH lock AS MATERIALIZED (SELECT pg_try_advisory_xact_lock(hashtext('room_info'), $1) AS got)
-            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title, live_id_str, live_time)
-            SELECT NOW(), $1, $2, $3, $4, $5, $6, $7, $8
+            INSERT INTO room_info (time, room_id, area_id, area_name, parent_area_id, parent_area_name, title, live_id_str)
+            SELECT NOW(), $1, $2, $3, $4, $5, $6, $7
             WHERE
                 (SELECT got FROM lock)
             AND NOT COALESCE((
@@ -111,7 +111,6 @@ impl Insertable for RoomInfo {
             self.parent_area_name,
             self.title,
             self.up_session,
-            self.live_time
         )
     }
 }
