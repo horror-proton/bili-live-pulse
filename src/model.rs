@@ -36,12 +36,26 @@ pub struct RoomInfo {
     pub parent_area_name: String,
     pub live_status: Option<i16>,
     pub title: String,
-    #[serde(alias = "live_id_str")]
+    #[serde(
+        alias = "live_id_str",
+        deserialize_with = "deserialize_empty_zero_as_none",
+        default
+    )]
     pub up_session: Option<String>,
 
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_sqlx_datetime")]
     pub live_time: Option<DateTime<FixedOffset>>,
+}
+
+fn deserialize_empty_zero_as_none<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(deserializer)?;
+    Ok(s.filter(|v| !v.is_empty() && v != "0"))
 }
 
 static TIMEZONE: FixedOffset = FixedOffset::east_opt(8 * 3600).unwrap();
@@ -122,7 +136,7 @@ impl RoomInfo {
             .get("data")
             .context(format!("Missing data field in {}", rsp.to_string()))?;
         let result = Self::deserialize(data)
-            .context(format!("Failed to deserialize from {}", rsp.to_string()))?;
+            .context(format!("Failed to deserialize from {}", data.to_string()))?;
         Ok(Self { room_id, ..result })
     }
 
@@ -633,6 +647,18 @@ mod tests {
         let room_info = RoomInfo::from_api_result(12345, &ret)?;
         assert!(room_info.live_time.is_none());
         test_insertable(&room_info).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_room_info_batch_result() -> Result<()> {
+        let ret = json!({"room_id":31255806,"uid":702013828,"area_id":701,"live_status":0,"live_url":"https://live.bilibili.com/31255806","parent_area_id":11,"title":"全球地震预警-信息/海啸信息/EEW","parent_area_name":"知识","area_name":"科技·科学","live_time":"0000-00-00 00:00:00","description":"直播全球地震信息、海啸信息、突发火山信息。直播间内容未经允许禁止二次利用！","tags":"EEW,地震预警,地震信息,地震,自然灾害,灾害,Earthquake,中国,日本,地理","attention":16774,"online":0,"short_id":0,"uname":"azzbm","cover":"https://i0.hdslb.com/bfs/live/new_room_cover/7ada6fa2338213fda7f82e9a3b4247264390de5c.jpg","background":"https://i0.hdslb.com/bfs/live/f3c1e1e22dfb1942bd88c33f1aa174efe7a38dfd.jpg","join_slide":1,"live_id":0,"live_id_str":"0","lock_status":0,"hidden_status":0,"is_encrypted":false});
+        let room_info = RoomInfo::deserialize(ret)?;
+        assert_eq!(room_info.up_session, None);
+        let ret = json!({"room_id":14047,"uid":19193,"area_id":701,"live_status":1,"live_url":"https://live.bilibili.com/14047","parent_area_id":11,"title":"从国际空间站俯瞰地球，静谧蓝星守护者","parent_area_name":"知识","area_name":"科技·科学","live_time":"2026-04-24 09:41:43","description":"本直播间通常转播ISS国际空间站和NASA地面若干直播频道，有火箭发射安排的时候会转播火箭放射实况，有重大天文事件的时候也会安排转播。\n本直播间仅仅是个人爱好以及科普推广用意，所以投食随意，欢迎支持UP的服务器费用。\n因为这是一个科普相关的直播间，同时也是一个令人放松的直播间，所以发言请谨慎。如果违反以下条款，视情况警告，禁言或者举报。\n本直播间直播流采用特殊H264编码方式，非常节省流量和CPU，视频通常为 30FPS 720P 。\n国际空间站介绍：一个在近地轨道上运行的科研设施，是人类历史上第九个载人的空间站。空间站的主要功能是作为在微重力环境下的研究实验室，研究领域包括生物学、物理学、天文学、地理学、气象学等。","tags":"国际空间站,ISS,太空,宇航员,空间站,地球,音乐","attention":503368,"online":2175,"short_id":0,"uname":"Zelo-Balance","cover":"https://i0.hdslb.com/bfs/live/new_room_cover/594557990bd87ddc4d237d7e78af8e67548fdf48.jpg","background":"https://i0.hdslb.com/bfs/live/2bac063036fbcf316e021fbfb8109ff3028360a6.jpg","join_slide":1,"live_id":691499741929813727_u64,"live_id_str":"691499741929813727","lock_status":0,"hidden_status":0,"is_encrypted":false});
+        let room_info = RoomInfo::deserialize(ret)?;
+        assert_eq!(room_info.up_session, Some("691499741929813727".to_string()));
         Ok(())
     }
 
