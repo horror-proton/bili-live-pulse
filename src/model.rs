@@ -113,7 +113,7 @@ impl Insertable for RoomInfo {
                 AND live_id_str IS NOT DISTINCT FROM $7
                 FROM room_info
                 WHERE room_id = $1
-                AND time > NOW() - INTERVAL '60 minutes'
+                AND time > NOW() - INTERVAL '1 day'
                 ORDER BY time DESC
                 LIMIT 1
             ), FALSE)
