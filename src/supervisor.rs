@@ -69,18 +69,22 @@ pub struct Supervisor {
     // returns the room_id along with the task's result.
     room_watch_join_set: Mutex<JoinSet<(u32, Result<()>)>>,
 
-    handlers_join_set: Mutex<JoinSet<()>>,
+    handlers_join_set: Option<Mutex<JoinSet<()>>>,
     self_check: bool,
 }
 
 impl Supervisor {
-    pub fn new(pool: PgPool, cli: Arc<ApiClient>, self_check: bool) -> Self {
+    pub fn new(pool: PgPool, cli: Arc<ApiClient>, self_check: bool, run_handlers: bool) -> Self {
         Self {
             supervisees: Mutex::new(SuperviseeRegistry::default()),
             pool,
             cli,
             room_watch_join_set: Mutex::new(JoinSet::new()),
-            handlers_join_set: Mutex::new(JoinSet::new()),
+            handlers_join_set: if run_handlers {
+                Some(Mutex::new(JoinSet::new()))
+            } else {
+                None
+            },
             self_check,
         }
     }
@@ -167,25 +171,27 @@ impl Supervisor {
         drop(supervisees);
 
         let live_status_c = live_status.clone();
-        self.handlers_join_set.lock().await.spawn(async move {
-            // let mut message_rx = message_tx.subscribe();
-            loop {
-                match message_rx.recv().await {
-                    Ok(message) => {
-                        if let Err(err) = live_status_c.handle_message(&message).await {
-                            error!(room_id; "Error handling message for room: {:#}", err);
+        if let Some(js) = &self.handlers_join_set {
+            js.lock().await.spawn(async move {
+                // let mut message_rx = message_tx.subscribe();
+                loop {
+                    match message_rx.recv().await {
+                        Ok(message) => {
+                            if let Err(err) = live_status_c.handle_message(&message).await {
+                                error!(room_id; "Error handling message for room: {:#}", err);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(room_id; "Missed {} messages", n)
+                        }
+                        Err(e) => {
+                            error!(room_id; "Error receiving message for room: {:#}", e);
+                            break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(room_id; "Missed {} messages", n)
-                    }
-                    Err(e) => {
-                        error!(room_id; "Error receiving message for room: {:#}", e);
-                        break;
-                    }
                 }
-            }
-        });
+            });
+        };
 
         info!(room_id; "Adding and starting watch for room {}.", room_id);
         let self_check = self.self_check;

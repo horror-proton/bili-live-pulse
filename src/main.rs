@@ -1,20 +1,21 @@
 use anyhow::Result;
+use axum::http::StatusCode;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
-
-use axum::http::StatusCode;
-use sqlx::postgres::PgPoolOptions;
 
 mod api;
 mod client;
 mod coordinator;
 mod live_status;
-mod model;
 mod metrics;
+mod model;
 mod msg;
 mod pgcache;
 mod room_watch;
+mod sse_client;
 mod supervisor;
 mod token_bucket;
 mod utils;
@@ -34,6 +35,8 @@ struct Args {
     coordinator_dns: String,
     /// Port used with DNS-discovered instances (default: 8080).
     coordinator_dns_port: u16,
+    /// SSE server url if run as sse client
+    as_sse_client: Option<String>,
     /// Port to listen on (default: 8080).
     port: u16,
     /// Self check connections
@@ -49,6 +52,7 @@ impl Args {
             coordinator_instances: String::new(),
             coordinator_dns: String::new(),
             coordinator_dns_port: 8080,
+            as_sse_client: None,
             port: 8080,
             self_check: !no_self_check_env,
         };
@@ -78,6 +82,11 @@ impl Args {
                 "--coordinator-dns-port" => {
                     if let Some(val) = argv.next() {
                         args.coordinator_dns_port = val.parse().unwrap_or(8080);
+                    }
+                }
+                "--as-sse-client" => {
+                    if let Some(val) = argv.next() {
+                        args.as_sse_client = Some(val.to_string());
                     }
                 }
                 "--port" => {
@@ -125,6 +134,7 @@ Environment variables:
   LIVE_ROOM_ID               Comma-separated list of room IDs to monitor
   LIVE_CONCURRENT_ATTEMPT    Number of concurrent connection attempts (default: 5)
   NO_SELF_CHECK              If set, disables self-check connections
+  NO_HANDLER                 If set, does not start websocket handlers, handlers should be run in sse client
   (build feature) metrics    If built with `--features metrics`, exposes Prometheus metrics at `GET /metrics`
 
 Examples:
@@ -152,15 +162,6 @@ async fn main() -> Result<()> {
         return run_coordinator(args).await;
     }
 
-    run_instance(args).await
-}
-
-/// Run as a regular instance (websocket connection handler).
-async fn run_instance(
-    Args {
-        port, self_check, ..
-    }: Args,
-) -> Result<()> {
     let dml =
         std::env::var("DATABASE_URL").unwrap_or("postgres://postgres@localhost/test".to_string());
 
@@ -181,6 +182,25 @@ async fn run_instance(
         .filter(|s| *s != 0)
         .collect::<Vec<u32>>();
 
+    if args.as_sse_client.is_some() {
+        run_sse_client(args, pool).await
+    } else {
+        run_instance(args, pool, room_ids).await
+    }
+}
+
+async fn run_sse_client(args: Args, pool: PgPool) -> Result<()> {
+    sse_client::run_sse_client(pool, &args.as_sse_client.unwrap()).await
+}
+
+/// Run as a regular instance (websocket connection handler).
+async fn run_instance(
+    Args {
+        port, self_check, ..
+    }: Args,
+    pool: PgPool,
+    room_ids: Vec<u32>,
+) -> Result<()> {
     let wbi_keys = wbi::get_wbi_keys().await?;
     info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
 
@@ -188,7 +208,14 @@ async fn run_instance(
     info!("Instance ID: {}", instance_id);
     let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
     let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
-    let sup = Arc::new(Supervisor::new(pool.clone(), cli.clone(), self_check));
+
+    let run_handler = std::env::var_os("NO_HANDLER").is_none();
+    let sup = Arc::new(Supervisor::new(
+        pool.clone(),
+        cli.clone(),
+        self_check,
+        run_handler,
+    ));
 
     use axum::extract::State;
     let app = axum::Router::new()
