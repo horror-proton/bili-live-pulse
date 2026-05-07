@@ -30,6 +30,9 @@ pub struct RoomInfo {
     #[serde(skip)]
     pub room_id: i32,
 
+    pub uid: Option<i64>,
+    pub uname: Option<String>,
+
     pub area_id: i32,
     pub area_name: String,
     pub parent_area_id: i32,
@@ -164,6 +167,13 @@ impl RoomInfo {
         if let Some(live_meta) = lm {
             insert_struct(pool, &live_meta).await?;
         }
+
+        if let (Some(uid), Some(uname)) = (self.uid, &self.uname) {
+            store_bili_user(uid, self.room_id, uname)
+                .execute(pool)
+                .await?;
+        }
+
         Ok(())
     }
 }
@@ -178,6 +188,15 @@ pub fn store_live_meta_end_time(room_id: i32, key_not_eq: Option<String>) -> PgQ
         "#,
         room_id,
         key_not_eq,
+    )
+}
+
+pub fn store_bili_user(uid: i64, room_id: i32, uname: &str) -> PgQuery<'static> {
+    query!(
+        r#"INSERT INTO bili_user (uid, room_id, "name") VALUES ($1, $2, $3) ON CONFLICT (uid) DO NOTHING"#,
+        uid,
+        room_id,
+        uname
     )
 }
 
@@ -722,6 +741,8 @@ mod tests {
 
         let mut ri = RoomInfo {
             room_id: 12345,
+            uid: None,
+            uname: None,
             area_id: 0,
             area_name: String::new(),
             parent_area_id: 0,

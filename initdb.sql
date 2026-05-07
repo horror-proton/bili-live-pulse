@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS live_meta (
 COMMENT ON COLUMN live_meta.end_time_before IS 'The first time we observed the stream ended.';
 
 CREATE INDEX IF NOT EXISTS idx_live_meta_room_id ON live_meta(room_id);
+CREATE INDEX live_meta_live_time_idx ON public.live_meta USING btree (live_time DESC);
+
+--
+
+CREATE TABLE IF NOT EXISTS bili_user (
+    "uid"       BIGINT      PRIMARY KEY,
+    "room_id"   INTEGER,
+    "name"      TEXT        NOT NULL
+);
+
+CREATE INDEX bili_user_room_id_idx ON public.bili_user (room_id);
 
 --
 
