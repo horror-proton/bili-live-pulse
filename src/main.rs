@@ -190,7 +190,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run_sse_client(args: Args, pool: PgPool) -> Result<()> {
-    sse_client::run_sse_client(pool, &args.as_sse_client.unwrap()).await
+    let wbi_keys = wbi::get_wbi_keys().await?;
+    info!("Fetched wbi_keys: ({}, {})", wbi_keys.0, wbi_keys.1);
+
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    info!("Instance ID: {}", instance_id);
+    let room_key_cache = Arc::new(msg::RoomKeyCache::new(pool.clone(), &instance_id));
+    let cli = Arc::new(client::ApiClient::new(wbi_keys.clone(), room_key_cache));
+    sse_client::run_sse_client(pool, &args.as_sse_client.unwrap(), cli).await
 }
 
 /// Run as a regular instance (websocket connection handler).

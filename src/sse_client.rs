@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::FutureExt;
 
+use crate::client::ApiClient;
 use crate::live_status::LiveStatus;
 use crate::msg;
 use crate::msg::LiveMessage;
@@ -133,13 +134,56 @@ impl SseClient {
 
         for &missing in desired.difference(&current) {
             self.add_room(missing);
+            tokio::task::yield_now().await;
         }
 
         Ok(())
     }
+
+    async fn handle_room_concilation(&self, cli: Arc<ApiClient>) {
+        let live_statuses = {
+            self.rooms
+                .iter()
+                .map(|(room_id, s)| (*room_id, s.live_status.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        if live_statuses.is_empty() {
+            return;
+        }
+
+        let room_ids = live_statuses
+            .iter()
+            .map(|(room_id, _)| *room_id)
+            .collect::<Vec<_>>();
+
+        let mut room_info_by_room_id =
+            match cli.get_live_status_batch(room_ids.iter().copied()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Error fetching live status batch: {:#}", e);
+                    return;
+                }
+            };
+
+        for (room_id, live_status) in live_statuses {
+            let room_info = match room_info_by_room_id.remove(&room_id) {
+                Some(ri) => ri,
+                None => {
+                    warn!(room_id; "Missing room info in batch response");
+                    continue;
+                }
+            };
+
+            match live_status.apply_room_info(room_info).await {
+                Ok(ri) => debug!(room_id; "Conciled live status {:?}", ri),
+                Err(e) => error!(room_id; "Error conciling live status for room: {:?}", e),
+            }
+        }
+    }
 }
 
-pub async fn run_sse_client(pool: PgPool, server: &str) -> anyhow::Result<()> {
+pub async fn run_sse_client(pool: PgPool, server: &str, cli: Arc<ApiClient>) -> anyhow::Result<()> {
     let mut sse_cli = SseClient {
         pool,
         base_url: server.to_string(),
@@ -153,6 +197,8 @@ pub async fn run_sse_client(pool: PgPool, server: &str) -> anyhow::Result<()> {
         if let Err(e) = sse_cli.update_room_list().await {
             error!("update room list: {:?}", e);
         }
+
+        sse_cli.handle_room_concilation(cli.clone()).await;
     }
 }
 

@@ -114,7 +114,9 @@ impl Supervisor {
                     }
                 },
                 _ = concile_interval.tick() => {
-                    self.handle_room_concilation().await;
+                    if self.handlers_join_set.is_some() {
+                        self.handle_room_concilation().await;
+                    }
                 }
             }
         }
@@ -346,6 +348,7 @@ impl Supervisor {
         }
     }
 
+    // TODO: move to sse client
     async fn handle_room_concilation(&self) {
         let live_statuses = {
             let supervisees = self.supervisees.lock().await;
