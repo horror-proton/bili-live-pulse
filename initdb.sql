@@ -153,7 +153,7 @@ CREATE INDEX live_meta_live_time_idx ON public.live_meta USING btree (live_time 
 --
 
 CREATE TABLE IF NOT EXISTS bili_user (
-    "uid"       BIGINT      PRIMARY KEY,
+    "uid"       BIGINT      UNIQUE NOT NULL,
     "room_id"   INTEGER,
     "name"      TEXT        NOT NULL
 );
