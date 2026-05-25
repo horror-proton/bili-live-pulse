@@ -149,6 +149,11 @@ impl LiveStatus {
                     let record = model::Guard::from_msg(room_id, m)?;
                     model::insert_struct(pool, &record).await?;
                 }
+                Some("SUPER_CHAT_MESSAGE") => {
+                    let m = &serde_json::value::to_value(buf)?;
+                    let record = model::SuperChat::from_msg(room_id, m)?;
+                    model::insert_struct(pool, &record).await?;
+                }
                 Some("WATCHED_CHANGE") => {
                     let m = &serde_json::value::to_value(buf)?;
                     if self.live_status.load(Ordering::SeqCst) != 1 {

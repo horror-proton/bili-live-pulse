@@ -410,6 +410,61 @@ impl Insertable for Watched {
 }
 
 #[derive(Deserialize)]
+pub struct SuperChat {
+    #[serde(skip)]
+    room_id: i32,
+
+    id: i32,
+    start_time: i64,
+    message: String,
+    time: i32,
+    price: i32,
+    uid: i64,
+    uname: Option<String>,
+}
+
+impl FromMsg for SuperChat {
+    fn from_msg(room_id: u32, m: &serde_json::Value) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let room_id = room_id as i32;
+        let data = m.get("data").context("Missing data field")?;
+
+        let uname = data
+            .get("user_info")
+            .and_then(|v| v.get("uname"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut result = Self::deserialize(data)?;
+        result.uname = uname;
+        result.room_id = room_id;
+
+        Ok(result)
+    }
+}
+
+impl Insertable for SuperChat {
+    fn build_query(&self) -> PgQuery<'_> {
+        query!(
+            r#"
+            INSERT INTO super_chat (start_time, room_id, id, message, duration, price, uid, username)
+            VALUES (TO_TIMESTAMP($1), $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (room_id, start_time, id) DO NOTHING
+            "#,
+            self.start_time as f64,
+            self.room_id,
+            self.id,
+            self.message,
+            self.time,
+            self.price,
+            self.uid,
+            self.uname,
+        )
+    }
+}
+
+#[derive(Deserialize)]
 pub struct Guard {
     #[serde(skip)]
     room_id: i32,
@@ -847,6 +902,25 @@ mod tests {
 
         assert_eq!(res.rows_affected(), 0, "Should be blocked by conflict");
         tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_insert_super_chat() -> Result<()> {
+        let ret = json!({"cmd":"SUPER_CHAT_MESSAGE","data":{"background_image":"","background_price_color":"#7497CD","color_point":0.7,"dmscore":714,"end_time":1779714477,"gift":{},"group_medal":{"is_lighted":0,"medal_id":0,"name":""},"id":16366795,"is_mystery":false,"is_ranked":0,"is_send_audit":1,"medal_info":{},"message":"住了十年的家要卖掉了，最近一直忙着整理，看着自己的房间一点一点搬空有一点点小伤心","message_font_color":"#A3F6FF","message_trans":"","price":30,"rate":1000,"start_time":1779714417,"time":60,"token":"A6AE9AAF","trans_mark":0,"ts":1779714417,"uid":1523317,"user_info":{"guard_level":3,"is_main_vip":0,"is_svip":0,"is_vip":0,"level_color":"#61c05a","manager":0,"name_color":"#00D1F1","title":"","uname":"李闻听不见","user_level":14}},"is_report":true,"msg_id":"95588751354394116:1000:1000","p_is_ack":true,"p_msg_type":1,"send_time":1779714417104u64});
+        let data = SuperChat::from_msg(12345, &ret)?;
+
+        let pool = test_pool().await;
+
+        let mut tx = get_tx(&pool).await;
+        let res = data.build_query().execute(&mut *tx).await?;
+        assert_eq!(res.rows_affected(), 1);
+        let res = data.build_query().execute(&mut *tx).await?;
+
+        assert_eq!(res.rows_affected(), 0, "Should be blocked by conflict");
+        tx.rollback().await?;
+
         Ok(())
     }
 

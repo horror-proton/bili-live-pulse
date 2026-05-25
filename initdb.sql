@@ -136,6 +136,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_guard_time_uid ON guard(time, "uid");
 
 --
 
+CREATE TABLE IF NOT EXISTS super_chat (
+    start_time  TIMESTAMPTZ NOT NULL,
+    room_id     INTEGER     NOT NULL,
+    id          INTEGER     NOT NULL,
+    message     TEXT        NOT NULL,
+    duration    INTEGER     NOT NULL,
+    price       INTEGER     NOT NULL,
+    "uid"       BIGINT      NOT NULL,
+    "username"  TEXT
+) WITH (
+    tsdb.hypertable,
+    tsdb.partition_column = 'start_time',
+    tsdb.segmentby = 'room_id',
+    tsdb.orderby = 'start_time DESC'
+);
+
+CREATE UNIQUE INDEX super_chat_room_id_start_time_id_idx ON super_chat (room_id, start_time DESC, "id");
+
+--
+
 CREATE TABLE IF NOT EXISTS live_meta (
     "live_id_str"   TEXT        UNIQUE NOT NULL,
     "room_id"       INTEGER     NOT NULL,
