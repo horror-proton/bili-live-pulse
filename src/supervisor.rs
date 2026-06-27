@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use log::{debug, error, info, trace, warn};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -89,6 +90,49 @@ impl Supervisor {
         }
     }
 
+    async fn update_rooms_from_file(&self) -> Result<()> {
+        let file_path = if let Ok(path) = std::env::var("LIVE_ROOM_ID_FILE") {
+            path
+        } else {
+            return Ok(());
+        };
+
+        let file_content = std::fs::read_to_string(file_path)?;
+        let file_room_ids = file_content
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<u32>().ok())
+            .filter(|s| *s != 0)
+            .collect::<HashSet<u32>>();
+
+        if file_room_ids.is_empty() {
+            warn!("No valid room IDs found in file.");
+            return Ok(());
+        }
+
+        let self_room_ids = self
+            .supervisees
+            .lock()
+            .await
+            .by_room_id
+            .keys()
+            .copied()
+            .collect::<HashSet<u32>>();
+
+        for &extra in self_room_ids.difference(&file_room_ids) {
+            self.remove_room(extra).await?;
+        }
+
+        for &missing in file_room_ids.difference(&self_room_ids) {
+            let live_status = Arc::new(LiveStatus::new(missing, self.pool.clone()));
+            self.add_room_blocking(missing, live_status).await?;
+            tokio::task::yield_now().await;
+        }
+
+        Ok(())
+    }
+
     pub async fn room_counts(&self) -> (usize, usize) {
         let supervisees = self.supervisees.lock().await;
         let supervised = supervisees.by_room_id.len();
@@ -117,6 +161,11 @@ impl Supervisor {
                     if self.handlers_join_set.is_some() {
                         self.handle_room_concilation().await;
                     }
+                    if !self.self_check {
+                        if let Err(e) = self.update_rooms_from_file().await {
+                            error!("Error updating rooms from file: {:#}", e);
+                        }
+                    }
                 }
             }
         }
@@ -138,6 +187,26 @@ impl Supervisor {
     pub async fn wait_room_connection_ready(&self, room_id: u32) -> Result<(), StatusCode> {
         let supervisee = self.get_room(room_id).await.ok_or(StatusCode::NOT_FOUND)?;
         supervisee.wait_connection_ready().await;
+        Ok(())
+    }
+
+    pub async fn remove_room(&self, room_id: u32) -> Result<()> {
+        info!(room_id; "Removing room {} from supervision.", room_id);
+
+        let supervisee = {
+            let mut supervisees = self.supervisees.lock().await;
+            supervisees.by_room_id.remove(&room_id)
+        };
+
+        if let Some(supervisee) = supervisee {
+            // Cancel the current connection
+            let cancel_token = supervisee.cancel_token.lock().await;
+            cancel_token.cancel();
+            info!(room_id; "Room {} removed from supervision.", room_id);
+        } else {
+            warn!(room_id; "Room {} was not being supervised.", room_id);
+        }
+
         Ok(())
     }
 
@@ -290,7 +359,12 @@ impl Supervisor {
             Ok((room_id, task_result)) => {
                 let (message_tx, cancel_token_arc) = {
                     let supervisees = self.supervisees.lock().await;
-                    let supervisee = supervisees.by_room_id.get(&room_id).unwrap();
+                    let supervisee = if let Some(ee) = supervisees.by_room_id.get(&room_id) {
+                        ee
+                    } else {
+                        debug!(room_id; "Room is no longer supervised. Ignoring failure.");
+                        return;
+                    };
 
                     supervisee.set_connection_ready(false); // TODO
 
