@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'Build and upload image'
+        description: "Build and upload image"
         type: boolean
         required: false
-        default: 'false'
+        default: "false"
 
 jobs:
   build:
@@ -55,13 +55,13 @@ jobs:
       - name: Build
         run: |
           cargo fetch --target x86_64-unknown-linux-gnu
-          cargo build --frozen --all-features --verbose
+          cargo build --frozen --all-features --verbose --release
       - name: Test
         run: |
           cargo test --all --verbose
       - uses: actions/upload-artifact@v4
         with:
-          path: target/debug/bili-live-pulse
+          path: target/release/bili-live-pulse
 
   build-image:
     if: ${{ github.ref == 'refs/heads/master' || github.event.inputs.image == true }}
