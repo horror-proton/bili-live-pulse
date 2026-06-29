@@ -124,10 +124,9 @@ impl Supervisor {
             self.remove_room(extra).await?;
         }
 
-        for &missing in file_room_ids.difference(&self_room_ids) {
+        for &missing in file_room_ids.difference(&self_room_ids).take(6) {
             let live_status = Arc::new(LiveStatus::new(missing, self.pool.clone()));
             self.add_room_blocking(missing, live_status).await?;
-            tokio::task::yield_now().await;
         }
 
         Ok(())
